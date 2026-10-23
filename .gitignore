@@ -23,8 +23,6 @@ so101/rerun-out/
 outputs/
 lerobot-outputs/
 rerun-out/
-data/*
-!data/.gitignore
 *.zip
 *.safetensors
 

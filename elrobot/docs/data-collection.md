@@ -91,9 +91,9 @@ Read the CLI log: it lists kept and discarded episodes. If you see `insufficient
 | `${DATASET_OUTPUT}.parquet` | Exported ML dataset (e.g. `data/elrobot-pizza.parquet` at repo root) |
 | `${DATASET_OUTPUT}.mp4` | Optional preview from `export_dataset.sh` |
 
-Parquet files are local artifacts — not committed to git. Back them up before wiping `station_data`.
+Back up Parquet files before wiping `station_data`. This repository includes small sample Parquet exports and MP4 previews under `data/`, alongside the converted dataset under `newdata/`.
 
-Do not commit large episode exports to this repo. Keep parquets on disk, Hub, or team object storage.
+Do not commit large episode exports to this repo. Keep larger datasets on the Hub or team object storage.
 
 ## Dataset format (Station parquet)
 

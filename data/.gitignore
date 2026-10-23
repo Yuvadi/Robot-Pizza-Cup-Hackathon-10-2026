@@ -1,3 +1,5 @@
-# Keep this file so the empty data/ directory stays in git.
+# Include sample datasets and previews; ignore other local data.
 *
 !.gitignore
+!*.parquet
+!*.mp4

@@ -2,6 +2,24 @@
 
 Commands below run from `elrobot`. Start Station with `bash scripts/run.sh` and open http://localhost:8889. Camera framing: [ElRobot README — Cameras](../README.md#cameras).
 
+## Bash scripts fail in WSL
+
+Run scripts with Bash. From `elrobot/scripts`, use `bash install.sh`, not
+`install.sh`: Bash does not search the current directory for commands by default.
+
+An error such as `: invalid option nameset: pipefail` or `$'\r': command not found`
+means the script has Windows CRLF line endings. Convert all ElRobot shell scripts,
+including sourced helpers, to Unix LF endings. From `elrobot/scripts`:
+
+```bash
+sed -i 's/\r$//' ./*.sh
+bash install.sh
+```
+
+The repository's `.gitattributes` keeps shell scripts LF on future Git checkouts.
+When editing them on Windows, keep the editor's line-ending setting on **LF**.
+WSL runs the Linux binary; USB hardware must also be made available to WSL.
+
 ## No camera stream in Station
 
 Arms show up, but the camera icon next to **3D** stays grey (“No active cameras”) and the camera dropdown stays on **None**.
