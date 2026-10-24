@@ -129,13 +129,17 @@ Tweak drivers in `norma-core/bin/station.yaml` only when you understand the upst
 
 Click the arm's bus to open **Calibrating Bus: [serial]**. Opening this page resets that arm's calibration.
 
-1. **Move every joint by hand through its full range,** including the gripper. Keep moving until Station has seen each joint move far enough.
-2. **Follower (12 V): click Auto Calibrate.** The arm moves each joint to its mechanical stop, one joint at a time. Clear the workspace, keep hands out, and keep one person at the power switch. Click **Stop Calibration** to abort.
-3. **Leader (5 V): skip Auto Calibrate.** Station disables it below 7 V and shows a low-voltage warning. That is expected. The ranges from step 1 are the calibration.
-4. **Click Save.** The 3D view should follow your moves, and every motor should travel from 0% to 100%. Then click **Done**. Station locks the calibration.
-5. If calibration fails: click **Reset**, then repeat, or calibrate by hand only (step 1, then Save).
+1. Stop all control programs and mirroring. Support the arm before disabling torque.
+2. **Move every joint gently by hand through its intended safe range,** including the gripper. Never force mechanical stops.
+3. Use this manual workflow for both follower (12 V) and leader (5 V); do not select Auto Calibrate.
+4. **Click Save/Done** to freeze calibration. Inspect Station's terminal for write/verification errors.
+5. Keep torque off while the guided script verifies and saves the profile. Calibration changes can invalidate old training data and policies.
 
-Use the web UI for the event. The wrapper below runs the upstream SO-101 auto-cal sequence on the **follower** serial from `elrobot.env`. It drives motors to their mechanical stops. Clear the workspace first. Calibrate the 5 V leader by hand (step 3), not with this script.
+For guided **manual calibration of both arms and saved serial-bound profiles**,
+use the wrapper below. It no longer runs the six-motor SO-101 automatic routine.
+It sends no hardware commands; it guides the Station UI actions and verifies
+frozen ranges before saving. Back up existing ranges before opening the calibration
+page, which resets them. See [calibration and backups](docs/calibration.md).
 
 ```bash
 bash scripts/calibrate.sh
@@ -190,7 +194,7 @@ The bundled trainer defaults to **6** motor dimensions (SO-101). ElRobot has **8
 elrobot.env.example         leader/follower serials, TASK, episode timing
 scripts/install.sh          shallow-clone into norma-core/ + release binary
 scripts/run.sh              start or stop Station
-scripts/calibrate.sh        follower auto-cal (upstream example)
+scripts/calibrate.sh        guided manual calibration + leader/follower profiles
 scripts/teleop.sh           leader → follower (upstream example)
 scripts/export_dataset.sh   history range → parquet + mp4
 scripts/python_env.sh       optional PYTHONPATH for elrobot/examples/

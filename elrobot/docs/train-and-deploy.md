@@ -1,23 +1,155 @@
 # ElRobot — Train, deploy, and evaluate
 
-Fine-tune and run policies on the ElRobot follower using NormaCore Station parquet and the **`smolvla_py`** trainer shipped in norma-core **v0.1.0-beta.10**. This is **not** the LeRobot `lerobot-train` path — see [SO-101 train and deploy](../../so101/docs/train-and-deploy.md).
+There are two dataset formats: converted **LeRobot v2.1 datasets** use the eight-joint workflow below; raw **Station Parquet** uses the legacy `smolvla_py` workflow later in this document. Do not interchange their trainers or checkpoints.
 
-**Prerequisites:** Station running, buses calibrated, exported `.parquet` from [data collection](data-collection.md). Setup: [ElRobot README](../README.md).
+**Prerequisites:** CUDA GPU and a compatible dataset. Live follower tests additionally require Station running and calibrated buses. Raw Station exports come from [data collection](data-collection.md). Setup: [ElRobot README](../README.md).
 
 Run commands from `elrobot` unless a step says `cd norma-core/...`.
 
 ## Contents
 
 - [Fine-tune (SmolVLA)](#fine-tune)
+- [Eight-joint Hugging Face dataset workflow](#eight-joint-hub-dataset)
 - [Deploy on the arm](#deploy-on-arm)
 - [Evaluation](#evaluation)
 - [Limits and troubleshooting](#limits)
 
 ---
 
+<a id="eight-joint-hub-dataset"></a>
+
+## Eight-joint Hugging Face dataset workflow (WSL)
+
+`PeteVLA/cheese2` is LeRobot **v2.1**, not raw Station Parquet. Its metadata specifies
+8 episodes, 3,193 frames at 10 FPS, eight normalized state/action values, and
+two 224x224 video cameras (`camera_0`, `camera_1`). The recorded task is exactly
+**`spreading cheese on pizza`**, not `place cheese on the pizza`.
+
+Use the isolated [training environment](../training/pyproject.toml), not the
+SO-101 environment or upstream `smolvla_py`. It pins LeRobot 0.3.3 for v2.1
+compatibility and PyTorch 2.7.1/CUDA 12.8 for the RTX 5090. Do not upgrade
+LeRobot independently: later dataset/processor APIs are different.
+
+### Environment and preflight
+
+Run these commands **inside WSL**, from `elrobot/training`:
+
+```bash
+# First-time system dependencies (evdev needs the Linux input headers).
+sudo apt-get update
+sudo apt-get install -y build-essential linux-libc-dev ffmpeg
+
+# Install uv if missing, then create the dedicated Python 3.12 environment.
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+uv sync --locked
+uv run python train.py --check-only
+```
+
+Preflight downloads the dataset, decodes its first pair of camera frames,
+checks dimensions/timing, and executes a CUDA matrix multiplication. It does not
+start training or connect to the robot. Model weights download separately on
+the first training run. No native Windows Python or Conda activation is needed.
+
+### Fine-tune
+
+```bash
+uv run python train.py --steps 5000 --batch-size 8 --output outputs/cheese-smolvla
+```
+
+The wrapper uses `lerobot/smolvla_base`, infers eight-joint features/statistics
+from the dataset, and disables automatic Hub uploads and W&B logging. If memory
+is insufficient, retry with `--batch-size 4` and a new output path. Existing output
+directories are refused. Checkpoints include policy normalization buffers:
+
+```text
+outputs/cheese-smolvla/checkpoints/last/pretrained_model/
+```
+
+Eight demonstrations are a small smoke-test dataset, not evidence of robust
+autonomous performance. Inspect the videos and hold out complete demonstrations
+when comparing models; the command above trains on all eight and does not report
+a held-out success score.
+
+### Offline checkpoint test (no robot connection)
+
+```bash
+uv run python follow.py \
+  --checkpoint outputs/cheese-smolvla/checkpoints/last/pretrained_model \
+  --offline
+```
+
+This predicts from the first recorded observation and prints the prediction
+beside its recorded action. It is a wiring check, not a task-success evaluation.
+
+### Live follower dry run
+
+Before connecting a policy, verify all of the following:
+
+- Training joints refer to this follower, with the same calibration and ascending
+  motor-ID ordering. The dataset labels `joint_0` through `joint_7` do not encode
+  anatomical identity. Eight matching dimensions alone are not sufficient.
+- The physical cameras and framing match training. Station orders cameras by
+  device identity; changing USB attachment can change their order. Verify it
+  visually. `--camera-order 0,1` maps Station images 0/1 to training camera_0/1;
+  use `1,0` only if their order is reversed.
+- Stop leader teleoperation and any other policy process.
+- Station runs in the **same WSL instance** with fresh inference frames. The
+  bridge rejects stale joint/camera timestamps and does not support remote clocks.
+- Pin `st3215-bus` under the `inference/normvla` entry in the **active**
+  `norma-core/bin/station.yaml` to the follower's exact serial, replacing `auto`.
+  Restart Station after changing it. The frame format contains no bus/motor
+  identity, so the bridge relies on this configuration and your explicit mapping.
+- Station may stop producing inference frames when all torque is disabled.
+  The bridge never enables torque; use the existing supervised Station workflow
+  to establish valid telemetry. Do not disable guards to get past missing frames.
+  A stale-frame error reports the sample age; an old frame can remain in history
+  even while the web UI is connected. Verify that the selected follower is online,
+  calibrated, and producing valid telemetry, and that both cameras are streaming.
+  Check Station's terminal for inference skip reasons. The Linux bridge compares
+  timestamps using Station's `CLOCK_BOOTTIME`; do not increase the age limit to
+  accept an old observation.
+
+From `elrobot/training` (replace placeholders; IDs 1..8 are only an example):
+
+```bash
+uv run python follow.py \
+  --checkpoint outputs/cheese-smolvla/checkpoints/last/pretrained_model \
+  --bus-serial FOLLOWER_SERIAL \
+  --motor-ids 1,2,3,4,5,6,7,8 \
+  --camera-order 0,1
+```
+
+Default behavior is **prediction only**, with no robot writes. It rejects wrong
+dimensions, invalid/out-of-range actions, and calibration mismatches. It prints
+all eight current positions, predicted targets, and calibrated-arc deltas in ticks,
+marking movements over 100 ticks as `OVER LIMIT` and blocked for execution.
+Over-limit previews never send commands; execution still rejects these movements
+(the limit cannot be disabled).
+Prediction-only mode refreshes telemetry after inference for its movement-bound
+preview, allowing slow initial predictions without accepting stale live telemetry.
+Execution additionally requires that the original prediction input is still
+within the two-second freshness limit; a slow prediction cannot authorize motion.
+
+Only after verifying the printed predictions, calibration, mappings and clear
+workspace, rerun that command with `--execute`. It requires typing
+`MOVE FOLLOWER_SERIAL` and sends **one** bounded sync-write, then exits.
+It refreshes telemetry and rechecks joint limits immediately before sending.
+It does not enable torque, run an autonomous episode, or automatically disable
+holding torque on exit. Keep a physical power stop accessible; a model prediction
+and these software guards do not guarantee collision avoidance.
+
+Hardware-free safety tests:
+
+```bash
+uv run python -m unittest -v test_safety test_follow
+```
+
+---
+
 <a id="fine-tune"></a>
 
-## 1. Fine-tune (SmolVLA)
+## 1. Legacy raw Station Parquet fine-tuning (six-joint default)
 
 Trainer: [`software/ai/smolvla_py`](https://github.com/norma-core/norma-core/tree/v0.1.0-beta.10/software/ai/smolvla_py). It fine-tunes `lerobot/smolvla_base` on Station parquet files. Requires **CUDA**.
 

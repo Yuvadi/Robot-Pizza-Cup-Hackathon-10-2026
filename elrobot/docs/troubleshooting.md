@@ -20,6 +20,16 @@ The repository's `.gitattributes` keeps shell scripts LF on future Git checkouts
 When editing them on Windows, keep the editor's line-ending setting on **LF**.
 WSL runs the Linux binary; USB hardware must also be made available to WSL.
 
+If the error names `elrobot.env` instead of a shell script, that sourced file also
+needs LF endings. From `elrobot` in WSL:
+
+```bash
+sed -i 's/\r$//' elrobot.env
+```
+
+The local environment file is ignored by Git, so checkout attributes cannot
+normalize it automatically. Keep its editor line-ending setting on **LF**.
+
 ## No camera stream in Station
 
 Arms show up, but the camera icon next to **3D** stays grey (“No active cameras”) and the camera dropdown stays on **None**.

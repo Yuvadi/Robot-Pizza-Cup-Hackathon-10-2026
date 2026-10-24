@@ -16,6 +16,9 @@ elrobot/elrobot.env
 elrobot/station
 elrobot/station.yaml
 elrobot/station_data/
+elrobot/calibrations/
+elrobot/training/local-datasets/
+Multi-Modal-Approach/local/
 
 so101/outputs/
 so101/lerobot-outputs/

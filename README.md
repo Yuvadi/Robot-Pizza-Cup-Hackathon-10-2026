@@ -15,6 +15,9 @@ Each team has two kits: a LeRobot SO-101 pair and an ElRobot pair. Pick the arm 
 
 Status: **Draft v0.1**.
 
+**Geometry + manipulation skeleton:** [Multi-Modal-Approach](Multi-Modal-Approach/README.md).
+**ElRobot manual calibration profiles:** [Calibration and backups](elrobot/docs/calibration.md).
+
 ---
 
 ## SO-101 (LeRobot)
