@@ -30,6 +30,12 @@ class PredictionTests(unittest.TestCase):
         self.assertEqual(follow.predict(policy, {}), [0.5] * 8)
         policy.reset.assert_called_once()
 
+    def test_rollout_prediction_preserves_chunk_cache(self):
+        policy = Mock()
+        policy.select_action.return_value = torch.full((1, 8), 0.5)
+        self.assertEqual(follow.predict(policy, {}, reset=False), [0.5] * 8)
+        policy.reset.assert_not_called()
+
     def test_prediction_rejects_invalid_output(self):
         for tensor in (torch.zeros(1, 6), torch.full((1, 8), float("nan")), torch.ones(1, 8) * 1.1):
             policy = Mock()
@@ -53,6 +59,89 @@ class PredictionTests(unittest.TestCase):
         self.assertEqual(follow.sample_indices(2293, 5), [0, 573, 1146, 1719, 2292])
         self.assertEqual(follow.sample_indices(3, 10), [0, 1, 2])
         self.assertEqual(follow.sample_indices(10, 1), [0])
+
+    def test_rollout_limit_diagnostics_separate_target_jump_from_tracking(self):
+        joints = [Joint(2000, .5, 1000, 3000)] * 8
+        with patch("builtins.print") as output, self.assertRaises(ValueError):
+            follow.rollout_goals([.65] * 8, joints, 200, [2050] * 8,
+                                 list(range(1, 9)), "chunk_start=True")
+        lines = [str(call.args[0]) for call in output.call_args_list]
+        self.assertIn("1 2000 2300 +300 2050 250 50", lines)
+        self.assertTrue(any("chunk_start=True" in line for line in lines))
+
+
+class RolloutTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.args = SimpleNamespace(execute=True, rollout_seconds=.25, camera_order="0,1",
+                                    motor_ids="1,2,3,4,5,6,7,8",
+                                    task="place cheese on pizza", max_delta_ticks=100)
+        self.policy = Mock(config=SimpleNamespace(n_action_steps=50))
+        self.policy.select_action.return_value = torch.full((1, 8), 0.5)
+        self.send = AsyncMock()
+        self.stamp = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+        self.joints = [Joint(2000, .5, 1000, 3000)] * 8
+        self.decoder = self.enterContext(patch("follow.decode_frame", return_value=({}, self.joints)))
+        self.age = self.enterContext(patch("follow.check_frame_age"))
+
+        async def fetch():
+            self.stamp += 100_000_000
+            stamp = self.stamp
+            return SimpleNamespace(get_monotonic_stamp_ns=lambda: stamp)
+
+        self.fetch = AsyncMock(side_effect=fetch)
+
+    async def test_duration_caps_sends_and_preserves_chunk_state(self):
+        await follow.rollout(self.args, self.policy, self.fetch, self.send)
+        self.assertGreaterEqual(self.send.await_count, 1)
+        self.assertLessEqual(self.send.await_count, 3)
+        self.assertEqual(self.policy.reset.call_count, 2)
+        self.assertEqual(self.policy.config.n_action_steps, 50)
+        self.assertEqual(self.policy.select_action.call_count, self.send.await_count)
+
+    async def test_invalid_prediction_never_sends(self):
+        self.policy.select_action.return_value[0, 1] = -.01
+        with self.assertRaises(ValueError):
+            await follow.rollout(self.args, self.policy, self.fetch, self.send)
+        self.send.assert_not_awaited()
+        self.assertEqual(self.policy.config.n_action_steps, 50)
+
+    async def test_large_delta_never_sends(self):
+        self.policy.select_action.return_value = torch.full((1, 8), .9)
+        with self.assertRaises(ValueError):
+            await follow.rollout(self.args, self.policy, self.fetch, self.send)
+        self.send.assert_not_awaited()
+
+    async def test_stale_prediction_never_sends(self):
+        self.age.side_effect = ValueError("stale")
+        with self.assertRaises(ValueError):
+            await follow.rollout(self.args, self.policy, self.fetch, self.send)
+        self.send.assert_not_awaited()
+
+    async def test_calibration_change_never_sends(self):
+        self.decoder.side_effect = [({}, self.joints), ({}, [Joint(2000, .5, 900, 3100)] * 8)]
+        with self.assertRaisesRegex(ValueError, "Calibration"):
+            await follow.rollout(self.args, self.policy, self.fetch, self.send)
+        self.send.assert_not_awaited()
+
+    async def test_expired_deadline_after_inference_never_sends(self):
+        with patch("follow.time.monotonic", side_effect=[0, 0, 0, 0, 0, 1]):
+            await follow.rollout(self.args, self.policy, self.fetch, self.send)
+        self.send.assert_not_awaited()
+
+    async def test_duplicate_frame_aborts_after_one_send(self):
+        frame = SimpleNamespace(get_monotonic_stamp_ns=lambda: self.stamp)
+        self.fetch.side_effect = None
+        self.fetch.return_value = frame
+        with self.assertRaisesRegex(ValueError, "did not advance"):
+            await follow.rollout(self.args, self.policy, self.fetch, self.send)
+        self.send.assert_awaited_once()
+
+    async def test_cancellation_stops_without_extra_send(self):
+        self.send.side_effect = asyncio.CancelledError()
+        with self.assertRaises(asyncio.CancelledError):
+            await follow.rollout(self.args, self.policy, self.fetch, self.send)
+        self.assertEqual(self.send.await_count, 1)
+        self.assertEqual(self.policy.reset.call_count, 2)
 
 
 class BridgeTests(unittest.IsolatedAsyncioTestCase):
@@ -117,6 +206,13 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await follow.live(self.args, Mock())
         self.sender.assert_not_awaited()
         self.client.close_connection.assert_called_once()
+
+    async def test_rollout_confirmation_is_distinct_and_can_cancel(self):
+        self.args.execute = True
+        self.args.rollout_seconds = 20
+        with patch("builtins.input", return_value="MOVE FOLLOWER"), self.assertRaisesRegex(ValueError, "not confirmed"):
+            await follow.live(self.args, Mock())
+        self.sender.assert_not_awaited()
 
     async def test_out_of_range_dry_run_reports_without_converting_or_sending(self):
         self.prediction.return_value = [0.5, -0.0084, 0.5, 1.0075, 0.5, 0.5, 0.5, 0.5]

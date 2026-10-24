@@ -1,6 +1,6 @@
 import unittest
 
-from safety import Joint, ensure_fresh, goals, motor_ids, verify_station_config
+from safety import Joint, ensure_fresh, goals, motor_ids, span, verify_station_config
 
 
 class SafetyTests(unittest.TestCase):
@@ -30,6 +30,17 @@ class SafetyTests(unittest.TestCase):
     def test_wraparound_calibration(self):
         joints = [Joint(0, 196 / 396, 3900, 200)] * 8
         self.assertEqual(goals([206 / 396] * 8, joints, 100), [10] * 8)
+
+    def test_outside_arc_reports_actual_position_and_distance(self):
+        for joint, distance in (
+            (Joint(3185, 1.0, 920, 3176), 9),
+            (Joint(919, 0.0, 920, 3176), 1),
+            (Joint(201, 1.0, 3900, 200), 1),
+        ):
+            with self.subTest(joint=joint), self.assertRaisesRegex(
+                ValueError, rf"position={joint.position}.*outside_by={distance} ticks"
+            ):
+                span(joint)
 
     def test_positive_bounded_limit_required(self):
         for limit in (0, -1, 201):

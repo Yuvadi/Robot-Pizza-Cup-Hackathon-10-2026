@@ -131,6 +131,58 @@ beside its recorded action. It is a wiring check, not a task-success evaluation.
 
 ### Live follower dry run
 
+#### Optional bounded policy rollout
+
+The default `--execute` path still sends only one target. To test a policy over
+time, additionally pass `--rollout-seconds 20` (maximum 20 seconds). For example,
+from `elrobot/training`:
+
+```bash
+.venv/bin/python follow.py \
+  --checkpoint ../../cheese-smolvla-v2-policy \
+  --task "place cheese on pizza" \
+  --bus-serial 5B61032837 \
+  --motor-ids 1,2,3,4,5,6,7,8 \
+  --camera-order 0,1 \
+  --max-delta-ticks 100 --execute --rollout-seconds 20
+```
+
+This requires the separate confirmation `ROLLOUT 5B61032837 20`. Verify the
+actual mappings and calibration, stop recording, leader mirroring, browser
+motor adjustments, and other policies, clear the workspace, and keep a physical
+stop accessible. The application does not establish exclusive control.
+
+The rollout preserves the policy action queue between ticks, consumes at most
+10 actions per chunk (then replans with current images), and sends at most
+10 targets per second without catch-up bursts. The duration includes inference
+and reads; a slow first inference can end the run without sending a command.
+Every target is checked against input and refreshed telemetry. Invalid/non-finite
+predictions, excessive movement, stale or non-advancing input, calibration changes,
+and read/send errors abort the run without retrying or clipping.
+
+Movement-limit aborts print the prediction number, whether a new action chunk
+started, inference duration, and a per-motor diagnostic table. `gap` is proposed
+target minus observed position along the calibrated arc; `target_change` compares
+the proposed target to the previous command from this rollout; `tracking_gap`
+compares that previous target to observed position. The previous target is a
+commanded value, not proof of motor receipt or exclusive control. These values
+help distinguish policy jumps from tracking lag without weakening the limit.
+
+An observed position outside its calibrated arc stops execution even if Station
+reports a normalized endpoint of `0` or `1`. The error identifies the zero-based
+joint slot, raw position, calibration endpoints, and distance outside the arc.
+Do not widen calibration or clamp telemetry merely to suppress this error.
+Check the physical pose and calibration through the supported manual workflow
+before another policy attempt.
+
+Ctrl+C stops new commands once control returns from any in-flight inference.
+There is no independent hardware watchdog or collision detection. The process
+does **not** enable/disable torque or retract an already sent goal; timeout,
+abort, or exit can leave motors moving toward or holding the last goal.
+Use the physical stop for immediate intervention, not Ctrl+C alone.
+
+#### Preconditions and single-target preview
+
 Before connecting a policy, verify all of the following:
 
 - Training joints refer to this follower, with the same calibration and ascending

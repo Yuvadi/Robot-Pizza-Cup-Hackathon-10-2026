@@ -34,8 +34,9 @@ def validate_policy(policy) -> None:
             raise ValueError(f"Checkpoint {key} must have shape (3, 224, 224).")
 
 
-def predict(policy, batch: dict, strict: bool = True) -> list[float]:
-    policy.reset()
+def predict(policy, batch: dict, strict: bool = True, reset: bool = True) -> list[float]:
+    if reset:
+        policy.reset()
     with torch.inference_mode():
         action = policy.select_action(batch)
     if tuple(action.shape) != (1, 8) or not torch.isfinite(action).all():
@@ -95,8 +96,11 @@ def decode_frame(frame, camera_order: list[int]) -> tuple[dict, list[Joint]]:
         Joint(j.get_position(), j.get_position_norm(), j.get_range_min(), j.get_range_max())
         for j in raw_joints
     ]
-    for joint in joints:
-        span(joint)
+    for index, joint in enumerate(joints):
+        try:
+            span(joint)
+        except ValueError as error:
+            raise ValueError(f"Station joint slot {index} (zero-based): {error}") from error
     batch = {
         "observation.state": torch.tensor(
             [[j.normalized for j in joints]], dtype=torch.float32, device="cuda"
@@ -121,6 +125,82 @@ def check_frame_age(frame) -> None:
     )
 
 
+def rollout_goals(action, joints, max_delta, previous_targets, ids, phase):
+    preview = goal_preview(action, joints)
+    if any(abs(delta) > max_delta for _, delta in preview):
+        print(f"ROLLOUT BLOCKED ({phase}): position gap exceeds {max_delta} ticks.", flush=True)
+        print("motor present target gap previous_target target_change tracking_gap", flush=True)
+        for index, (joint, (target, gap)) in enumerate(zip(joints, preview, strict=True)):
+            if previous_targets is None:
+                previous, change, tracking = "-", "-", "-"
+            else:
+                previous = previous_targets[index]
+                previous_offset = (previous - joint.minimum) % 4096
+                change = (target - joint.minimum) % 4096 - previous_offset
+                tracking = previous_offset - (joint.position - joint.minimum) % 4096
+            print(f"{ids[index]} {joint.position} {target} {gap:+d} {previous} {change} {tracking}",
+                  flush=True)
+    return goals(action, joints, max_delta)
+
+
+async def rollout(args, policy, fetch, send) -> None:
+    """Bounded rollout; callbacks supply telemetry and send validated targets."""
+    if not args.execute or not 0 < args.rollout_seconds <= 20:
+        raise ValueError("Rollout requires --execute and a duration in (0, 20].")
+    order = [int(value) for value in args.camera_order.split(",")]
+    original_steps = policy.config.n_action_steps
+    policy.config.n_action_steps = min(original_steps, 10)
+    policy.reset()
+    deadline = time.monotonic() + args.rollout_seconds
+    calibration = None
+    last_stamp = None
+    count = 0
+    previous_targets = None
+    ids = motor_ids(args.motor_ids)
+    try:
+        while time.monotonic() < deadline:
+            tick = time.monotonic()
+            frame = await fetch()
+            stamp = frame.get_monotonic_stamp_ns()
+            if last_stamp is not None and stamp <= last_stamp:
+                raise ValueError("Rollout input did not advance; stopping new commands.")
+            batch, joints = decode_frame(frame, order)
+            ranges = [(j.minimum, j.maximum) for j in joints]
+            if calibration is None:
+                calibration = ranges
+            if ranges != calibration:
+                raise ValueError("Calibration changed during rollout.")
+            batch["task"] = [args.task]
+            chunk_start = count % policy.config.n_action_steps == 0
+            inference_started = time.monotonic()
+            action = predict(policy, batch, reset=False)
+            inference_seconds = time.monotonic() - inference_started
+            check_frame_age(frame)
+            phase = (f"prediction={count + 1}, chunk_start={chunk_start}, "
+                     f"inference_s={inference_seconds:.3f}")
+            rollout_goals(action, joints, args.max_delta_ticks, previous_targets, ids, phase + ", input")
+            latest = await fetch()
+            _, current = decode_frame(latest, order)
+            if [(j.minimum, j.maximum) for j in current] != calibration:
+                raise ValueError("Calibration changed before rollout send.")
+            targets = rollout_goals(action, current, args.max_delta_ticks, previous_targets, ids,
+                                    phase + ", refreshed")
+            check_frame_age(latest)
+            if time.monotonic() >= deadline:
+                break
+            await send(targets)
+            previous_targets = targets
+            count += 1
+            last_stamp = latest.get_monotonic_stamp_ns()
+            print(f"Rollout command {count} enqueued; targets: {targets}", flush=True)
+            await asyncio.sleep(max(0.1, tick + 0.1 - time.monotonic()))
+    finally:
+        policy.config.n_action_steps = original_steps
+        policy.reset()
+        print(f"Rollout ended after {count} command packs. No further targets will be sent.")
+        print("Torque is unchanged; last sent goals may still be active. Use the physical stop if needed.")
+
+
 async def live(args, policy) -> None:
     if args.server not in ("localhost", "127.0.0.1"):
         raise ValueError("Live bridge supports only same-host WSL Station (localhost), not remote clocks.")
@@ -132,7 +212,17 @@ async def live(args, policy) -> None:
         raise ValueError("--camera-order must be 0,1 or 1,0 in training camera order.")
     config = yaml.safe_load(args.station_config.read_text())
     verify_station_config(config, args.bus_serial, args.queue)
-    if args.execute:
+    duration = getattr(args, "rollout_seconds", 0)
+    if duration:
+        if not args.execute or not 0 < duration <= 20:
+            raise ValueError("Rollout requires --execute and a duration in (0, 20].")
+        print(f"ROLLOUT: up to {duration:g} seconds. Stop mirroring, other policies, and recording.")
+        print("Clear the workspace; keep the physical stop accessible. Ctrl+C stops NEW commands only.")
+        print("Torque is not changed. At most 10 commands/second; chunks limited to 10 actions.")
+        phrase = f"ROLLOUT {args.bus_serial} {duration:g}"
+        if input(f"Type {phrase} to authorize: ").strip() != phrase:
+            raise ValueError("Rollout not confirmed; no commands sent.")
+    elif args.execute:
         print("ONE MOVEMENT ONLY. Stop teleoperation; verify follower bus, joint/camera order,")
         print("calibration, and a clear workspace. This script does not enable torque.")
         if input(f"Type MOVE {args.bus_serial} to permit one prediction/send: ").strip() != f"MOVE {args.bus_serial}":
@@ -158,7 +248,26 @@ async def live(args, policy) -> None:
         check_frame_age(frame)
         return frame
 
+    async def send(predicted):
+        sync = st3215.ST3215SyncWriteCommand(
+            address=0x2A,
+            motors=[
+                st3215.ST3215SyncWriteCommand_MotorWrite(
+                    motor_id=mid, value=target.to_bytes(2, "little")
+                )
+                for mid, target in zip(ids, predicted, strict=True)
+            ],
+        )
+        command = commands.DriverCommand(
+            type=drivers.StationCommandType.STC_ST3215_COMMAND,
+            body=st3215.Command(target_bus_serial=args.bus_serial, sync_write=sync).encode(),
+        )
+        await asyncio.wait_for(send_commands(client, [command]), timeout=1 if duration else 5)
+
     try:
+        if duration:
+            await rollout(args, policy, fetch, send)
+            return
         frame = await fetch()
         batch, joints = decode_frame(frame, order)
         batch["task"] = [args.task]
@@ -197,20 +306,7 @@ async def live(args, policy) -> None:
             raise ValueError("Calibration changed during inference; no commands sent.")
         predicted = goals(action, current, args.max_delta_ticks)
         check_frame_age(latest)
-        sync = st3215.ST3215SyncWriteCommand(
-            address=0x2A,
-            motors=[
-                st3215.ST3215SyncWriteCommand_MotorWrite(
-                    motor_id=mid, value=target.to_bytes(2, "little")
-                )
-                for mid, target in zip(ids, predicted, strict=True)
-            ],
-        )
-        command = commands.DriverCommand(
-            type=drivers.StationCommandType.STC_ST3215_COMMAND,
-            body=st3215.Command(target_bus_serial=args.bus_serial, sync_write=sync).encode(),
-        )
-        await asyncio.wait_for(send_commands(client, [command]), timeout=5)
+        await send(predicted)
         print("One command pack enqueued. This is not confirmation of completed physical motion.")
     finally:
         client.close_connection()
@@ -233,9 +329,13 @@ def main() -> None:
     parser.add_argument("--camera-order", help="Station image indices for training camera_0,camera_1, e.g. 0,1.")
     parser.add_argument("--max-delta-ticks", type=int, default=100)
     parser.add_argument("--execute", action="store_true", help="Explicitly permit ONE send after interactive confirmation.")
+    parser.add_argument("--rollout-seconds", type=float, default=0,
+                        help="With --execute: bounded rollout for up to 20 seconds instead of one send.")
     args = parser.parse_args()
     if args.offline and args.execute:
         parser.error("--offline cannot be combined with --execute.")
+    if not 0 <= args.rollout_seconds <= 20 or (args.rollout_seconds and (args.offline or not args.execute)):
+        parser.error("--rollout-seconds must be 0..20 and nonzero requires live --execute.")
     if not 1 <= args.max_delta_ticks <= 200:
         parser.error("--max-delta-ticks must be in 1..200; disabling the limit is not supported.")
     if not (args.checkpoint / "config.json").is_file():

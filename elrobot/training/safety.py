@@ -29,7 +29,13 @@ def span(joint: Joint) -> int:
     if width == 0:
         raise ValueError("Missing/invalid calibration: minimum equals maximum.")
     if (joint.position - joint.minimum) % 4096 > width:
-        raise ValueError("Present position is outside its calibrated arc.")
+        offset = (joint.position - joint.minimum) % 4096
+        outside = min(offset - width, 4096 - offset)
+        raise ValueError(
+            f"Present position is outside its calibrated arc: position={joint.position}, "
+            f"minimum={joint.minimum}, maximum={joint.maximum}, "
+            f"outside_by={outside} ticks. Refusing to clamp the observed position."
+        )
     if not math.isfinite(joint.normalized) or not 0 <= joint.normalized <= 1:
         raise ValueError("Invalid normalized joint position.")
     expected = ((joint.position - joint.minimum) % 4096) / width
