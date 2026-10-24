@@ -144,8 +144,12 @@ from `elrobot/training`:
   --bus-serial 5B61032837 \
   --motor-ids 1,2,3,4,5,6,7,8 \
   --camera-order 0,1 \
-  --max-delta-ticks 100 --execute --rollout-seconds 20
+  --max-delta-ticks 1500 --execute --rollout-seconds 20
 ```
+
+The movement limit defaults to 100 ticks and can be raised explicitly to at most
+1500 ticks per command for testing. A larger limit allows substantially larger
+physical movements; verify calibration and clear the workspace before execution.
 
 This requires the separate confirmation `ROLLOUT 5B61032837 20`. Verify the
 actual mappings and calibration, stop recording, leader mirroring, browser
@@ -155,10 +159,32 @@ stop accessible. The application does not establish exclusive control.
 The rollout preserves the policy action queue between ticks, consumes at most
 10 actions per chunk (then replans with current images), and sends at most
 10 targets per second without catch-up bursts. The duration includes inference
-and reads; a slow first inference can end the run without sending a command.
+and reads. Before the timed rollout, one no-motion inference warms up the policy;
+its prediction and cached actions are discarded. The bridge then fetches fresh
+observations for execution. Warm-up time is printed and excluded from the rollout
+duration. No warm-up action is sent, even if its input becomes stale during
+inference. Execution observations must still pass the unchanged two-second
+freshness checks before any command is sent.
 Every target is checked against input and refreshed telemetry. Invalid/non-finite
 predictions, excessive movement, stale or non-advancing input, calibration changes,
 and read/send errors abort the run without retrying or clipping.
+
+To opt into bounded retries for finite but out-of-range predictions, add
+`--max-invalid-retries 3` to the rollout command (allowed: 0..3; default: 0,
+immediate abort). Each rejection discards the entire eight-joint action and
+cached chunk, logs the values, and sends no command. After a rate-limited pause,
+the policy replans from a fresh, advancing observation. Three consecutive
+rejections allow three retries; a fourth consecutive rejection aborts.
+A successfully sent command resets the rejection counter. The original rollout
+deadline remains in force, and all other validation failures still abort.
+There is no clipping or mixing of joint actions. Previously sent goals remain
+active while retrying; a numerically valid prediction is not proof of safe motion.
+
+Each rollout prediction logs its inference duration before checking freshness.
+If freshness still fails after warm-up, compare the inference time with the
+reported sensor age: slow inference and already-old telemetry are distinct
+possibilities. Verify Station sensor updates; do not raise the freshness limit
+just to accept an old observation.
 
 Movement-limit aborts print the prediction number, whether a new action chunk
 started, inference duration, and a per-motor diagnostic table. `gap` is proposed

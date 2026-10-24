@@ -13,6 +13,19 @@ from safety import Joint
 
 
 class PredictionTests(unittest.TestCase):
+    def test_retry_cli_rejects_invalid_limits_and_nonrollout_modes(self):
+        for options in (
+            ["--max-invalid-retries", "-1"],
+            ["--execute", "--rollout-seconds", "20", "--max-invalid-retries", "4"],
+            ["--execute", "--max-invalid-retries", "1"],
+            ["--offline", "--max-invalid-retries", "1"],
+        ):
+            with self.subTest(options=options), \
+                    patch("sys.argv", ["follow.py", "--checkpoint", ".", *options]), \
+                    patch("sys.stderr"), self.assertRaises(SystemExit) as error:
+                follow.main()
+            self.assertEqual(error.exception.code, 2)
+
     def test_freshness_uses_linux_station_boottime_clock(self):
         sensor = SimpleNamespace(get_monotonic_stamp_ns=lambda: 9_900_000_000)
         frame = SimpleNamespace(
@@ -105,6 +118,91 @@ class RolloutTests(unittest.IsolatedAsyncioTestCase):
         self.send.assert_not_awaited()
         self.assertEqual(self.policy.config.n_action_steps, 50)
 
+    async def test_retry_discards_chunk_refetches_and_resets_consecutive_limit(self):
+        self.args.max_invalid_retries = 1
+        self.args.rollout_seconds = 1
+        invalid = torch.full((1, 8), 0.5)
+        invalid[0, 1] = -.01
+        valid = torch.full((1, 8), 0.5)
+
+        def first_valid():
+            self.assertEqual(self.fetch.await_count, 2)
+            self.assertEqual(self.policy.reset.call_count, 2)
+            self.send.assert_not_awaited()
+            return valid
+
+        outputs = iter([invalid, first_valid, invalid, valid, asyncio.CancelledError()])
+
+        def select(batch):
+            result = next(outputs)
+            if isinstance(result, BaseException):
+                raise result
+            return result() if callable(result) else result
+
+        self.policy.select_action.side_effect = select
+        with patch("follow.asyncio.sleep", new_callable=AsyncMock) as sleep, \
+                patch("builtins.print") as output, self.assertRaises(asyncio.CancelledError):
+            await follow.rollout(self.args, self.policy, self.fetch, self.send)
+        self.assertEqual(self.send.await_count, 2)
+        self.assertEqual(self.policy.reset.call_count, 4)
+        self.assertEqual(self.policy.config.n_action_steps, 50)
+        self.assertTrue(all(call.args[0] >= .1 for call in sleep.await_args_list))
+        lines = [str(call.args[0]) for call in output.call_args_list]
+        self.assertTrue(any("prediction=3, chunk_start=False" in line for line in lines))
+        self.assertTrue(any("prediction=4, chunk_start=True" in line for line in lines))
+
+    async def test_retry_limit_aborts_without_sending(self):
+        self.args.max_invalid_retries = 3
+        self.args.rollout_seconds = 1
+        self.policy.select_action.return_value = torch.full((1, 8), 1.01)
+        with patch("follow.asyncio.sleep", new_callable=AsyncMock) as sleep, \
+                self.assertRaisesRegex(ValueError, "retry limit exceeded"):
+            await follow.rollout(self.args, self.policy, self.fetch, self.send)
+        self.assertEqual(self.policy.select_action.call_count, 4)
+        self.assertEqual(self.fetch.await_count, 4)
+        self.assertEqual(sleep.await_count, 3)
+        self.send.assert_not_awaited()
+
+    async def test_retry_rejects_nonadvancing_input(self):
+        self.args.max_invalid_retries = 3
+        self.policy.select_action.return_value = torch.full((1, 8), -.01)
+        frame = SimpleNamespace(get_monotonic_stamp_ns=lambda: self.stamp)
+        self.fetch.side_effect = None
+        self.fetch.return_value = frame
+        with patch("follow.asyncio.sleep", new_callable=AsyncMock), \
+                self.assertRaisesRegex(ValueError, "did not advance"):
+            await follow.rollout(self.args, self.policy, self.fetch, self.send)
+        self.assertEqual(self.policy.select_action.call_count, 1)
+        self.send.assert_not_awaited()
+
+    async def test_retry_does_not_bypass_other_guards(self):
+        self.args.max_invalid_retries = 3
+        for tensor, message in (
+            (torch.full((1, 8), float("nan")), "finite"),
+            (torch.full((1, 8), float("inf")), "finite"),
+            (torch.zeros(1, 6), "finite"),
+            (torch.full((1, 8), .9), "requested movement"),
+        ):
+            with self.subTest(message=message):
+                self.policy.select_action.return_value = tensor
+                with patch("follow.asyncio.sleep", new_callable=AsyncMock) as sleep, \
+                        self.assertRaisesRegex(ValueError, message):
+                    await follow.rollout(self.args, self.policy, self.fetch, self.send)
+                sleep.assert_not_awaited()
+                self.send.assert_not_awaited()
+
+    async def test_retry_does_not_bypass_staleness_or_deadline(self):
+        self.args.max_invalid_retries = 3
+        self.policy.select_action.return_value = torch.full((1, 8), -.01)
+        self.age.side_effect = ValueError("stale")
+        with self.assertRaisesRegex(ValueError, "stale"):
+            await follow.rollout(self.args, self.policy, self.fetch, self.send)
+        self.age.side_effect = None
+        with patch("follow.time.monotonic", side_effect=[0, 0, 0, 0, 0, 1, 1]), \
+                patch("follow.asyncio.sleep", new_callable=AsyncMock):
+            await follow.rollout(self.args, self.policy, self.fetch, self.send)
+        self.send.assert_not_awaited()
+
     async def test_large_delta_never_sends(self):
         self.policy.select_action.return_value = torch.full((1, 8), .9)
         with self.assertRaises(ValueError):
@@ -113,8 +211,10 @@ class RolloutTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stale_prediction_never_sends(self):
         self.age.side_effect = ValueError("stale")
-        with self.assertRaises(ValueError):
+        with patch("builtins.print") as output, self.assertRaises(ValueError):
             await follow.rollout(self.args, self.policy, self.fetch, self.send)
+        lines = [str(call.args[0]) for call in output.call_args_list]
+        self.assertTrue(any("inference_s=" in line for line in lines))
         self.send.assert_not_awaited()
 
     async def test_calibration_change_never_sends(self):
@@ -213,6 +313,47 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         with patch("builtins.input", return_value="MOVE FOLLOWER"), self.assertRaisesRegex(ValueError, "not confirmed"):
             await follow.live(self.args, Mock())
         self.sender.assert_not_awaited()
+
+    async def test_rollout_warmup_discards_output_and_cache_before_refetch(self):
+        self.args.execute = True
+        self.args.rollout_seconds = 20
+        policy = Mock()
+
+        def warmup(*args, **kwargs):
+            self.sender.assert_not_awaited()
+            return [1.1] * 8
+
+        self.prediction.side_effect = warmup
+
+        async def run(args, warmed_policy, fetch, send):
+            self.assertIs(warmed_policy, policy)
+            policy.reset.assert_called_once()
+            self.assertEqual(self.client.read_from_tail.call_count, 1)
+            await fetch()
+            self.assertEqual(self.client.read_from_tail.call_count, 2)
+            self.sender.assert_not_awaited()
+
+        with patch("builtins.input", return_value="ROLLOUT FOLLOWER 20"), \
+                patch("follow.rollout", side_effect=run) as rollout:
+            await follow.live(self.args, policy)
+        self.assertFalse(self.prediction.call_args.kwargs["strict"])
+        rollout.assert_awaited_once()
+        self.sender.assert_not_awaited()
+        self.client.close_connection.assert_called_once()
+
+    async def test_failed_warmup_resets_cache_and_never_starts_rollout(self):
+        self.args.execute = True
+        self.args.rollout_seconds = 20
+        policy = Mock()
+        self.prediction.side_effect = ValueError("Invalid warm-up prediction")
+        with patch("builtins.input", return_value="ROLLOUT FOLLOWER 20"), \
+                patch("follow.rollout", new_callable=AsyncMock) as rollout, \
+                self.assertRaisesRegex(ValueError, "Invalid warm-up prediction"):
+            await follow.live(self.args, policy)
+        policy.reset.assert_called_once()
+        rollout.assert_not_awaited()
+        self.sender.assert_not_awaited()
+        self.client.close_connection.assert_called_once()
 
     async def test_out_of_range_dry_run_reports_without_converting_or_sending(self):
         self.prediction.return_value = [0.5, -0.0084, 0.5, 1.0075, 0.5, 0.5, 0.5, 0.5]

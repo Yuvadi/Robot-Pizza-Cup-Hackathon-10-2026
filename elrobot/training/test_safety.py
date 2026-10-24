@@ -43,9 +43,16 @@ class SafetyTests(unittest.TestCase):
                 span(joint)
 
     def test_positive_bounded_limit_required(self):
-        for limit in (0, -1, 201):
+        for limit in (0, -1, 1501):
             with self.subTest(limit=limit), self.assertRaises(ValueError):
                 goals([0.5] * 8, self.joints, limit)
+
+    def test_maximum_movement_limit_is_1500_ticks(self):
+        joints = [Joint(2000, 2000 / 4095, 0, 4095)] * 8
+        actions = [3500 / 4095] * 8
+        self.assertEqual(goals(actions, joints, 1500), [3500] * 8)
+        with self.assertRaises(ValueError):
+            goals(actions, joints, 1499)
 
     def test_motor_id_order_and_count(self):
         self.assertEqual(motor_ids("1,2,3,4,5,6,7,8"), list(range(1, 9)))

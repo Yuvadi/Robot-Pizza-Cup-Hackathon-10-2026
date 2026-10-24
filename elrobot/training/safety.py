@@ -5,6 +5,9 @@ from dataclasses import dataclass
 from typing import Sequence
 
 
+MAX_DELTA_TICKS = 1500
+
+
 @dataclass(frozen=True)
 class Joint:
     position: int
@@ -59,8 +62,8 @@ def goal_preview(actions: Sequence[float], joints: Sequence[Joint]) -> list[tupl
 
 
 def goals(actions: Sequence[float], joints: Sequence[Joint], max_delta: int) -> list[int]:
-    if not 1 <= max_delta <= 200:
-        raise ValueError("The movement limit must be between 1 and 200 servo ticks.")
+    if not 1 <= max_delta <= MAX_DELTA_TICKS:
+        raise ValueError(f"The movement limit must be between 1 and {MAX_DELTA_TICKS} servo ticks.")
     preview = goal_preview(actions, joints)
     for index, (_, delta) in enumerate(preview):
         if abs(delta) > max_delta:

@@ -14,7 +14,16 @@ import yaml
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from PIL import Image
 
-from safety import Joint, ensure_fresh, goal_preview, goals, motor_ids, span, verify_station_config
+from safety import (
+    MAX_DELTA_TICKS,
+    Joint,
+    ensure_fresh,
+    goal_preview,
+    goals,
+    motor_ids,
+    span,
+    verify_station_config,
+)
 
 
 ELROBOT = Path(__file__).resolve().parents[1]
@@ -147,6 +156,9 @@ async def rollout(args, policy, fetch, send) -> None:
     """Bounded rollout; callbacks supply telemetry and send validated targets."""
     if not args.execute or not 0 < args.rollout_seconds <= 20:
         raise ValueError("Rollout requires --execute and a duration in (0, 20].")
+    max_invalid_retries = getattr(args, "max_invalid_retries", 0)
+    if not 0 <= max_invalid_retries <= 3:
+        raise ValueError("--max-invalid-retries must be in 0..3.")
     order = [int(value) for value in args.camera_order.split(",")]
     original_steps = policy.config.n_action_steps
     policy.config.n_action_steps = min(original_steps, 10)
@@ -155,6 +167,9 @@ async def rollout(args, policy, fetch, send) -> None:
     calibration = None
     last_stamp = None
     count = 0
+    predictions = 0
+    chunk_steps = 0
+    consecutive_invalid = 0
     previous_targets = None
     ids = motor_ids(args.motor_ids)
     try:
@@ -171,13 +186,28 @@ async def rollout(args, policy, fetch, send) -> None:
             if ranges != calibration:
                 raise ValueError("Calibration changed during rollout.")
             batch["task"] = [args.task]
-            chunk_start = count % policy.config.n_action_steps == 0
+            chunk_start = chunk_steps % policy.config.n_action_steps == 0
             inference_started = time.monotonic()
-            action = predict(policy, batch, reset=False)
+            action = predict(policy, batch, strict=not max_invalid_retries, reset=False)
             inference_seconds = time.monotonic() - inference_started
-            check_frame_age(frame)
-            phase = (f"prediction={count + 1}, chunk_start={chunk_start}, "
+            predictions += 1
+            chunk_steps += 1
+            phase = (f"prediction={predictions}, chunk_start={chunk_start}, "
                      f"inference_s={inference_seconds:.3f}")
+            print(f"Rollout inference complete ({phase}); checking observation freshness.", flush=True)
+            check_frame_age(frame)
+            if any(value < 0 or value > 1 for value in action):
+                consecutive_invalid += 1
+                print(f"ROLLOUT REJECTED ({phase}): normalized goals outside [0, 1]: "
+                      f"{action}. No command sent; consecutive rejection "
+                      f"{consecutive_invalid}, retry limit {max_invalid_retries}.", flush=True)
+                policy.reset()
+                chunk_steps = 0
+                last_stamp = stamp
+                if consecutive_invalid > max_invalid_retries:
+                    raise ValueError("Out-of-range prediction retry limit exceeded; stopping rollout.")
+                await asyncio.sleep(max(0.1, tick + 0.1 - time.monotonic()))
+                continue
             rollout_goals(action, joints, args.max_delta_ticks, previous_targets, ids, phase + ", input")
             latest = await fetch()
             _, current = decode_frame(latest, order)
@@ -191,6 +221,7 @@ async def rollout(args, policy, fetch, send) -> None:
             await send(targets)
             previous_targets = targets
             count += 1
+            consecutive_invalid = 0
             last_stamp = latest.get_monotonic_stamp_ns()
             print(f"Rollout command {count} enqueued; targets: {targets}", flush=True)
             await asyncio.sleep(max(0.1, tick + 0.1 - time.monotonic()))
@@ -213,12 +244,18 @@ async def live(args, policy) -> None:
     config = yaml.safe_load(args.station_config.read_text())
     verify_station_config(config, args.bus_serial, args.queue)
     duration = getattr(args, "rollout_seconds", 0)
+    max_invalid_retries = getattr(args, "max_invalid_retries", 0)
+    if not 0 <= max_invalid_retries <= 3 or (max_invalid_retries and not duration):
+        raise ValueError("--max-invalid-retries must be 0..3; nonzero requires a rollout.")
     if duration:
         if not args.execute or not 0 < duration <= 20:
             raise ValueError("Rollout requires --execute and a duration in (0, 20].")
         print(f"ROLLOUT: up to {duration:g} seconds. Stop mirroring, other policies, and recording.")
         print("Clear the workspace; keep the physical stop accessible. Ctrl+C stops NEW commands only.")
         print("Torque is not changed. At most 10 commands/second; chunks limited to 10 actions.")
+        if max_invalid_retries:
+            print(f"Out-of-range actions: at most {max_invalid_retries} consecutive retries. "
+                  "Rejected actions send nothing; previous goals remain active.")
         phrase = f"ROLLOUT {args.bus_serial} {duration:g}"
         if input(f"Type {phrase} to authorize: ").strip() != phrase:
             raise ValueError("Rollout not confirmed; no commands sent.")
@@ -266,6 +303,18 @@ async def live(args, policy) -> None:
 
     try:
         if duration:
+            print("Warming up policy; no commands will be sent. Warm-up output is discarded.",
+                  flush=True)
+            frame = await fetch()
+            batch, _ = decode_frame(frame, order)
+            batch["task"] = [args.task]
+            started = time.monotonic()
+            try:
+                predict(policy, batch, strict=False)
+            finally:
+                policy.reset()
+            print(f"Warm-up completed in {time.monotonic() - started:.3f}s; "
+                  "fetching fresh observations for rollout.", flush=True)
             await rollout(args, policy, fetch, send)
             return
         frame = await fetch()
@@ -327,17 +376,31 @@ def main() -> None:
     parser.add_argument("--bus-serial")
     parser.add_argument("--motor-ids", help="Eight ascending IDs matching training joint order.")
     parser.add_argument("--camera-order", help="Station image indices for training camera_0,camera_1, e.g. 0,1.")
-    parser.add_argument("--max-delta-ticks", type=int, default=100)
+    parser.add_argument(
+        "--max-delta-ticks",
+        type=int,
+        default=100,
+        help=f"Maximum allowed movement per command (1..{MAX_DELTA_TICKS}; default: 100).",
+    )
     parser.add_argument("--execute", action="store_true", help="Explicitly permit ONE send after interactive confirmation.")
     parser.add_argument("--rollout-seconds", type=float, default=0,
                         help="With --execute: bounded rollout for up to 20 seconds instead of one send.")
+    parser.add_argument(
+        "--max-invalid-retries", type=int, default=0,
+        help="Rollout only: retry out-of-range actions up to 3 consecutive times (default: 0, abort).",
+    )
     args = parser.parse_args()
     if args.offline and args.execute:
         parser.error("--offline cannot be combined with --execute.")
     if not 0 <= args.rollout_seconds <= 20 or (args.rollout_seconds and (args.offline or not args.execute)):
         parser.error("--rollout-seconds must be 0..20 and nonzero requires live --execute.")
-    if not 1 <= args.max_delta_ticks <= 200:
-        parser.error("--max-delta-ticks must be in 1..200; disabling the limit is not supported.")
+    if not 0 <= args.max_invalid_retries <= 3 or (args.max_invalid_retries and not args.rollout_seconds):
+        parser.error("--max-invalid-retries must be 0..3; nonzero requires --rollout-seconds.")
+    if not 1 <= args.max_delta_ticks <= MAX_DELTA_TICKS:
+        parser.error(
+            f"--max-delta-ticks must be in 1..{MAX_DELTA_TICKS}; "
+            "disabling the limit is not supported."
+        )
     if not (args.checkpoint / "config.json").is_file():
         parser.error("--checkpoint must point to a trained checkpoint's pretrained_model directory.")
     if not torch.cuda.is_available():
