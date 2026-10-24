@@ -34,32 +34,55 @@ def validate_policy(policy) -> None:
             raise ValueError(f"Checkpoint {key} must have shape (3, 224, 224).")
 
 
-def predict(policy, batch: dict) -> list[float]:
+def predict(policy, batch: dict, strict: bool = True) -> list[float]:
     policy.reset()
     with torch.inference_mode():
         action = policy.select_action(batch)
     if tuple(action.shape) != (1, 8) or not torch.isfinite(action).all():
         raise ValueError(f"Expected one finite 8-joint action; got shape {tuple(action.shape)}.")
     values = action[0].cpu().tolist()
-    if any(value < 0 or value > 1 for value in values):
+    if strict and any(value < 0 or value > 1 for value in values):
         raise ValueError(f"Predicted normalized goals outside [0, 1]: {values}; refusing to clip.")
     return values
+
+
+def sample_indices(length: int, count: int) -> list[int]:
+    if length < 1 or count < 1:
+        raise ValueError("Dataset and sample count must be non-empty.")
+    count = min(count, length)
+    return sorted({round(i * (length - 1) / max(count - 1, 1)) for i in range(count)})
 
 
 def offline(args, policy) -> None:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     dataset = LeRobotDataset(args.dataset, root=getattr(args, "dataset_root", None), video_backend="pyav")
-    sample = dataset[0]
-    if sample["task"] != args.task:
-        raise ValueError(f"Task mismatch: dataset has {sample['task']!r}, supplied {args.task!r}.")
-    batch = {
-        key: sample[key].unsqueeze(0).to("cuda")
-        for key in ("observation.state", *CAMERAS)
-    }
-    batch["task"] = [args.task]
-    print("Offline predicted normalized goals:", predict(policy, batch))
-    print("Recorded normalized goals:", sample["action"].tolist())
+    errors, out_of_range = [], 0
+    for index in sample_indices(len(dataset), getattr(args, "samples", 1)):
+        sample = dataset[index]
+        if sample["task"] != args.task:
+            raise ValueError(f"Task mismatch: dataset has {sample['task']!r}, supplied {args.task!r}.")
+        batch = {
+            key: sample[key].unsqueeze(0).to("cuda")
+            for key in ("observation.state", *CAMERAS)
+        }
+        batch["task"] = [args.task]
+        predicted = predict(policy, batch, strict=False)
+        recorded = sample["action"].tolist()
+        error = [abs(p - r) for p, r in zip(predicted, recorded, strict=True)]
+        errors.append(error)
+        bad = [i for i, value in enumerate(predicted) if value < 0 or value > 1]
+        out_of_range += bool(bad)
+        print(f"\nFrame {index}:")
+        print("  predicted:", [round(v, 3) for v in predicted])
+        print("  recorded: ", [round(v, 3) for v in recorded])
+        print("  abs error:", [round(v, 3) for v in error])
+        if bad:
+            print(f"  OUT OF RANGE joints {bad}: live mode would REFUSE this prediction.")
+    per_joint = np.mean(errors, axis=0)
+    print("\nMean abs error per joint:", [round(float(v), 3) for v in per_joint])
+    print(f"Overall mean abs error: {float(per_joint.mean()):.3f}")
+    print(f"Frames with out-of-range predictions: {out_of_range}/{len(errors)}")
     print("OFFLINE ONLY: no Station connection and no robot commands.")
 
 
@@ -188,7 +211,8 @@ async def live(args, policy) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--offline", action="store_true", help="Predict from dataset frame 0; never connect to Station.")
+    parser.add_argument("--offline", action="store_true", help="Compare predictions with dataset frames; never connect to Station.")
+    parser.add_argument("--samples", type=int, default=5, help="Offline: number of evenly spaced dataset frames to evaluate.")
     parser.add_argument("--dataset", default="PeteVLA/cheese2")
     parser.add_argument("--dataset-root", type=Path, help="Local converted dataset for offline prediction.")
     parser.add_argument("--task", default="spreading cheese on pizza")

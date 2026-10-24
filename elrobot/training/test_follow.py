@@ -38,6 +38,23 @@ class PredictionTests(unittest.TestCase):
                 follow.predict(policy, {})
 
 
+    def test_offline_prediction_reports_out_of_range_without_raising(self):
+        policy = Mock()
+        policy.select_action.return_value = torch.full((1, 8), -0.05)
+        self.assertEqual(len(follow.predict(policy, {}, strict=False)), 8)
+
+    def test_non_strict_prediction_still_rejects_nan(self):
+        policy = Mock()
+        policy.select_action.return_value = torch.full((1, 8), float("nan"))
+        with self.assertRaises(ValueError):
+            follow.predict(policy, {}, strict=False)
+
+    def test_sample_indices_are_evenly_spread(self):
+        self.assertEqual(follow.sample_indices(2293, 5), [0, 573, 1146, 1719, 2292])
+        self.assertEqual(follow.sample_indices(3, 10), [0, 1, 2])
+        self.assertEqual(follow.sample_indices(10, 1), [0])
+
+
 class BridgeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()

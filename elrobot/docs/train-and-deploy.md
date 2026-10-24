@@ -107,6 +107,11 @@ After training, test without connecting to Station:
   --task "place cheese on pizza" --offline
 ```
 
+Offline mode compares predictions with recorded actions on `--samples`
+evenly spaced frames (default 5). It prints the per-joint error and flags
+predictions outside `[0, 1]`, which live mode would refuse. These frames come
+from the training data, so a low error shows fit, not generalisation.
+
 The dataset does not identify physical motor IDs for its eight joint slots.
 Matching dimensions do not establish compatibility with your follower or its
 new calibration. Do not execute the model on hardware without verifying the
@@ -121,7 +126,7 @@ uv run python follow.py \
   --offline
 ```
 
-This predicts from the first recorded observation and prints the prediction
+This predicts from evenly spaced recorded observations and prints each prediction
 beside its recorded action. It is a wiring check, not a task-success evaluation.
 
 ### Live follower dry run
