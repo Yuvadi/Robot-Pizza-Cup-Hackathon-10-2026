@@ -45,7 +45,8 @@ def convert(root: Path):
     tasks = {row["task_index"]: row["task"]
              for row in pq.read_table(source / "meta/tasks.parquet").to_pylist()}
     features = {
-        name: info["features"][name] for name in ("observation.state", "action")
+        name: {**info["features"][name], "shape": tuple(info["features"][name]["shape"])}
+        for name in ("observation.state", "action")
     }
     for target in CAMERAS.values():
         features[target] = {

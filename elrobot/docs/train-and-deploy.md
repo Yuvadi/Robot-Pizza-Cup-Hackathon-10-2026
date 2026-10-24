@@ -71,7 +71,49 @@ autonomous performance. Inspect the videos and hold out complete demonstrations
 when comparing models; the command above trains on all eight and does not report
 a held-out success score.
 
-### Offline checkpoint test (no robot connection)
+### Demo cheese dataset (local v3 conversion)
+
+`n4chi/7-robopizzeria-cheese-v1` contains 10 demonstrations / 2,293 frames
+at 10 FPS, with embedded top and front/wrist images. It is LeRobot v3 and
+cannot be passed directly to the pinned v2.1 trainer. Convert a pinned local
+copy without changing the source dataset or upgrading the environment:
+
+```bash
+# Inside WSL, from elrobot/training
+.venv/bin/python prepare_demo_cheese.py
+.venv/bin/python train.py \
+  --dataset local/demo-cheese-data \
+  --dataset-root local-datasets/demo-cheese-data --check-only
+.venv/bin/python train.py \
+  --dataset local/demo-cheese-data \
+  --dataset-root local-datasets/demo-cheese-data \
+  --output outputs/demo-cheese-data --steps 5000 --batch-size 8
+```
+
+Conversion preserves episode boundaries, normalized state/action slots, task
+labels and the uniform timeline. It maps **top to camera_0** and **front/wrist to
+camera_1**, encoding videos with the existing LeRobot writer. Source provenance
+and the pinned revision are saved with the converted dataset. Existing
+conversion/output directories are never overwritten. Original source timing
+fields remain available in the pinned source rather than in training features.
+
+After training, test without connecting to Station:
+
+```bash
+.venv/bin/python follow.py \
+  --checkpoint outputs/demo-cheese-data/checkpoints/last/pretrained_model \
+  --dataset local/demo-cheese-data \
+  --dataset-root local-datasets/demo-cheese-data \
+  --task "place cheese on pizza" --offline
+```
+
+The dataset does not identify physical motor IDs for its eight joint slots.
+Matching dimensions do not establish compatibility with your follower or its
+new calibration. Do not execute the model on hardware without verifying the
+joint mapping, calibration, framing and starting scene. This run trains on all
+10 episodes; it does not measure held-out task success or certify safe control.
+
+### Original cheese checkpoint offline test
 
 ```bash
 uv run python follow.py \
