@@ -22,6 +22,7 @@ from PIL import Image
 from safety import Joint, ensure_fresh, span, verify_station_config
 
 ROOT = Path(__file__).resolve().parents[2]
+TASK_CATEGORIES = ("pick_and_place_salami", "pick_and_place_cheese")
 JOINT_FIELDS = ("range_min", "range_max", "position", "position_norm", "goal", "goal_norm", "current_ma", "velocity")
 SCHEMA = pa.schema([
     ("episode_start_ns", pa.uint64()), ("global_frame_id", pa.binary()),
@@ -90,6 +91,7 @@ class Recorder:
             "active": self.active, "saved": self.records("saved"), "drafts": self.records("drafts"),
             "busy": self.busy, "job": self.job_status, "export": str(self.export) if self.export else None,
             "task": self.args.task, "repo": self.args.repo, "public": self.args.public,
+            "categories": list(dict.fromkeys((*TASK_CATEGORIES, self.args.task))),
             "elapsed": (time.monotonic() - self.active["clock"]) if self.active else 0,
         }
 
@@ -108,9 +110,9 @@ class Recorder:
             raise ValueError("Fresh synchronized cameras/joints required. Check Station and teleoperation.")
         calibration = [[j["range_min"], j["range_max"]] for j in self.latest["joints"]]
         for episode in self.records("saved"):
-            if (episode["calibration"] != calibration or episode["task"] != self.args.task
+            if (episode["calibration"] != calibration
                     or episode["follower_serial"] != self.args.bus_serial):
-                raise ValueError("Task, follower or calibration differs from saved episodes. Use a new --root.")
+                raise ValueError("Follower or calibration differs from saved episodes. Use a new --root.")
         identity = uuid.uuid4().hex
         folder = self.root / "drafts" / identity
         folder.mkdir()
@@ -173,7 +175,7 @@ class Recorder:
         if failure:
             self.error = failure
 
-    def manage(self, action: str, identity: str) -> None:
+    def manage(self, action: str, identity: str, task: str | None = None) -> None:
         self.idle()
         if not isinstance(identity, str) or len(identity) != 32 or any(c not in "0123456789abcdef" for c in identity):
             raise ValueError("Invalid episode identifier.")
@@ -181,11 +183,31 @@ class Recorder:
         source = self.root / category / identity
         metadata = json.loads((source / "episode.json").read_text())
         if action == "save":
+            selected_task = self.args.task if task is None else task
+            if selected_task not in (*TASK_CATEGORIES, self.args.task):
+                raise ValueError("Choose a supported episode category.")
             if metadata["status"] not in ("review", "saved"):
                 raise ValueError("Only completed, valid episodes can be saved. Discard interrupted recordings.")
             with pq.ParquetFile(source / "frames.parquet") as parquet:
                 if parquet.metadata.num_rows != metadata["frames"]:
                     raise ValueError("Episode frame count does not match its metadata.")
+            if selected_task != metadata["task"]:
+                temporary = source / "frames.relabel.partial"
+                try:
+                    with pq.ParquetFile(source / "frames.parquet") as parquet, \
+                            pq.ParquetWriter(temporary, SCHEMA, compression="zstd") as writer:
+                        for batch in parquet.iter_batches(batch_size=32):
+                            table = pa.Table.from_batches([batch])
+                            table = table.set_column(
+                                table.schema.get_field_index("task"), SCHEMA.field("task"),
+                                pa.array([selected_task] * table.num_rows, type=pa.string()),
+                            )
+                            writer.write_table(table)
+                    temporary.replace(source / "frames.parquet")
+                finally:
+                    temporary.unlink(missing_ok=True)
+                metadata["task"] = selected_task
+                atomic_json(source / "episode.json", metadata)
             # Windows/DrvFS refuses directory renames with an open Parquet reader.
             destination = self.root / "saved" / identity
             source.rename(destination)
@@ -347,7 +369,9 @@ def create_app(recorder: Recorder) -> web.Application:
         elif name == "stop":
             recorder.stop()
         elif name in ("save", "discard", "delete"):
-            recorder.manage(name, data["id"])
+            if name == "save" and not isinstance(data["task"], str):
+                raise ValueError("Choose a supported episode category.")
+            recorder.manage(name, data["id"], data["task"] if name == "save" else None)
         elif name in ("convert", "upload"):
             recorder.idle()
             if name == "upload" and data.get("confirm_repo") != recorder.args.repo:
@@ -381,8 +405,9 @@ def create_app(recorder: Recorder) -> web.Application:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT / "data/cheese-recordings")
-    parser.add_argument("--task", default="place cheese on pizza")
-    parser.add_argument("--repo", default="yaditya/place-cheese-on-pizza")
+    parser.add_argument("--task", default="pick_and_place_cheese",
+                        help="Default task; also offered alongside salami/cheese when saving a draft.")
+    parser.add_argument("--repo", default="yaditya/place-toppings-on-pizza")
     parser.add_argument("--public", action="store_true", help="Create public uploads; otherwise private.")
     parser.add_argument("--bus-serial", default="5B61032837")
     parser.add_argument("--port", type=int, default=8890)

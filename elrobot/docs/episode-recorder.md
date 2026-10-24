@@ -1,4 +1,4 @@
-# Browser episode recorder (WSL)
+# Place Toppings on Pizza - browser episode recorder (WSL)
 
 This is a read-only recording UI for NormaCore Station, not a robot controller.
 It records actual synchronized camera/joint/action frames directly to Parquet
@@ -11,14 +11,20 @@ Start Station and your usual supervised leader teleoperation separately. Stop
 all policy processes. From `elrobot/training` in WSL:
 
 ```bash
-.venv/bin/python recorder.py --public
+.venv/bin/python recorder.py --root ../../data/pick-and-place-recordings --public
 ```
 
 Open <http://localhost:8890> in your Windows browser.
 
-The defaults are task **place cheese on pizza**, repository
-**yaditya/place-cheese-on-pizza**, follower **5B61032837**. `--public` selects
+The default recording task is **pick_and_place_cheese**. After each recording,
+choose **pick_and_place_salami** or **pick_and_place_cheese** when saving.
+An explicit `--task` is also offered as an additional category for compatibility
+with existing recording workflows. The default upload repository remains
+**yaditya/place-toppings-on-pizza**, follower **5B61032837**. The recorder displays
+the dataset name **Place Toppings on Pizza**. `--public` selects
 public uploads; omit it for private uploads. These choices are shown in the UI.
+Use `--repo YOUR_ACCOUNT/YOUR_DATASET` to choose a different upload destination.
+The example uses a new local root so existing cheese recordings are not mixed in.
 The active Station configuration must pin `inference/normvla` to this follower.
 Verify ascending physical motor IDs 1 through 8 and the camera order in Station.
 The normvla frame format itself contains no physical bus or camera identity.
@@ -34,8 +40,16 @@ use its existing `uv sync` workflow; `aiohttp` is declared in `pyproject.toml`.
 3. Click **Record new episode**, then demonstrate using the leader.
 4. The timer stops capture automatically, or click **Stop & review** early.
    **Stopping capture never stops robot motion or teleoperation.**
-5. Click **Save episode** to keep the complete demonstration, or **Discard**.
+5. Under **Review drafts**, choose the category, then click **Save episode** to
+   keep the complete demonstration, or **Discard**. Save is disabled until you
+   choose a category. Each draft has its own selection.
 6. Reset the scene while not recording and repeat. Saved episodes can be deleted.
+
+The saved table shows each episode's category. Saving writes that exact task
+label into every raw Parquet frame and the episode metadata without changing
+joint values, JPEGs, timestamps, or frame IDs. Both categories can coexist in one
+dataset, but the follower and calibration must still match. Existing saved
+episodes retain their original labels; they are not automatically reclassified.
 
 Recordings use bounded 32-frame Parquet row groups, not an entire in-memory
 episode. State, goal actions, source frame IDs, JPEGs, and source-relative
@@ -68,6 +82,9 @@ recordings cannot resume; interrupted drafts are marked invalid.
 **Build / save LeRobot dataset** converts all saved episodes into a fresh v2.1
 snapshot at 10 FPS, with two H.264 videos per episode. It uses
 `transform_elrobot.py`, preserving normalized source goals without action shifts.
+The combined export includes both categories in `meta/tasks.jsonl`, with each
+episode/frame assigned the corresponding task index; separate exports or folder
+moves are not necessary.
 Adding/deleting a saved episode invalidates the current build; upload rebuilds
 it. Recording and episode edits are disabled during conversion/upload.
 

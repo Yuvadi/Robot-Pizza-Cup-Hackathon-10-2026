@@ -2,14 +2,15 @@
 <html lang="en">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Pizza episode recorder</title>
+<title>Place Toppings on Pizza</title>
 <style>
 :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#10151d;color:#e9eef6}
 body{max-width:1150px;margin:auto;padding:24px}h1{margin-bottom:4px}p{color:#aebbd0}
 .card{background:#1a2331;border:1px solid #344154;border-radius:14px;padding:20px;margin:18px 0}
 .feeds{display:grid;grid-template-columns:1fr 1fr;gap:18px}.feed{text-align:center}
 img{width:100%;max-width:400px;aspect-ratio:1;object-fit:contain;background:#0b0f16;border-radius:10px}
-button,input{padding:12px;border-radius:8px;border:1px solid #53647e;font:inherit}
+button,input,select{padding:12px;border-radius:8px;border:1px solid #53647e;font:inherit}
+select{background:#10151d;color:white;max-width:100%}
 button{cursor:pointer;background:#2d4665;color:white;margin:4px}button.primary{background:#16735c}
 button.danger{background:#773b43}button:disabled{opacity:.4;cursor:not-allowed}input{width:80px;background:#10151d;color:white}
 #timer{font-size:38px;font-variant-numeric:tabular-nums}.error{color:#ffb0ac;white-space:pre-wrap}
@@ -19,7 +20,7 @@ button.danger{background:#773b43}button:disabled{opacity:.4;cursor:not-allowed}i
 </style>
 </head>
 <body>
-<h1>Pizza episode recorder</h1>
+<h1>Place Toppings on Pizza</h1>
 <p>Record demonstrations, review episodes, and build a training dataset.</p>
 <div class="card warning">Read-only hardware access. This UI never enables torque, starts teleoperation, or sends motor commands.
 Operate the leader through Station. Stop recording before resetting the scene.</div>
@@ -29,7 +30,8 @@ Operate the leader through Station. Stop recording before resetting the scene.</
 <div class="feed"><h3>Station camera 1</h3><img id="cam1" alt="Camera 1: waiting for fresh synchronized frames"></div>
 </div>
 <div class="card">
-<h2 id="task">Place cheese on pizza</h2>
+<h2>Record a pizza demonstration</h2>
+<p id="task"></p>
 <label>Episode timer <input id="seconds" type="number" min="2" max="300" step="1" value="45"> seconds</label>
 <button id="start" class="primary" onclick="act('start',{seconds:Number(document.querySelector('#seconds').value)})">Record new episode</button>
 <button id="stop" class="danger" onclick="act('stop')">Stop &amp; review</button>
@@ -40,7 +42,7 @@ Camera order must remain unchanged across your demonstrations.</p>
 </div>
 <div class="card"><h2>Review drafts</h2><div id="drafts"></div></div>
 <div class="card"><h2>Saved episodes <span id="count"></span></h2><div class="scroll"><table>
-<thead><tr><th>Episode</th><th>Duration</th><th>Frames</th><th>Action</th></tr></thead><tbody id="episodes"></tbody>
+<thead><tr><th>Episode</th><th>Category</th><th>Duration</th><th>Frames</th><th>Action</th></tr></thead><tbody id="episodes"></tbody>
 </table></div><p class="small">Save keeps the complete joint/action data and both camera feeds locally. Delete moves the episode to local trash; it is excluded from future exports.</p></div>
 <div class="card"><h2>Dataset &amp; upload</h2>
 <p id="destination"></p>
@@ -54,6 +56,7 @@ Existing downloaded copies are not removed by deleting locally.</p>
 </div>
 <script>
 const token="__TOKEN__"; let current=null, pending=false, signature="", localError="";
+const selections=new Map();
 const el=id=>document.getElementById(id);
 function button(text,fn,danger=false){const b=document.createElement("button");b.textContent=text;b.onclick=fn;b.disabled=current.busy||!!current.active||pending;if(danger)b.className="danger";return b;}
 async function act(name,data={}) {
@@ -68,7 +71,7 @@ function renderButtons(){if(!current)return;const busy=current.busy||pending, ac
 function upload(){if(!current)return;const visibility=current.public?"PUBLIC (anyone can download camera images and telemetry)":"PRIVATE";
  if(confirm(`Upload ${current.saved.length} saved episodes to ${current.repo} as ${visibility}?\nThis replaces the remote dataset files. Ensure everyone visible in the recordings consents.`))act("upload",{confirm_repo:current.repo});}
 function render(s){current=s;el("connection").textContent=s.connection+(s.fresh?"":" — STALE / recording disabled");
- el("error").textContent=localError||s.error;el("task").textContent=s.task;
+ el("error").textContent=localError||s.error;el("task").textContent="Choose the category after each recording, before saving.";
  el("destination").textContent=`Destination: ${s.repo} • ${s.public?"Public":"Private"}`;
  el("timer").textContent=s.active?Math.max(0,s.active.timer-s.elapsed).toFixed(1)+" s remaining":"Ready";
  el("recording").textContent=s.active?`${s.active.frames} synchronized frames recorded. Stop early or wait for the timer.`:"Record, stop, then Save or Discard each draft.";
@@ -77,11 +80,20 @@ function render(s){current=s;el("connection").textContent=s.connection+(s.fresh?
  el("drafts").replaceChildren();
  for(const d of s.drafts){const row=document.createElement("div"),label=document.createElement("p");
  label.textContent=`${d.id.slice(0,8)} • ${d.duration.toFixed(1)} s • ${d.frames} frames • ${d.status}${d.error?" — "+d.error:""}`;row.append(label);
- if(d.status==="review")row.append(button("Save episode",()=>act("save",{id:d.id})));
+ if(d.status==="review"){
+ const label=document.createElement("label"),select=document.createElement("select");
+ label.textContent="Save into category: ";select.setAttribute("aria-label","Category for episode "+d.id.slice(0,8));
+ const placeholder=document.createElement("option");placeholder.value="";placeholder.textContent="Choose a category";select.append(placeholder);
+ for(const task of s.categories){const option=document.createElement("option");option.value=task;option.textContent=task;select.append(option);}
+ select.value=selections.get(d.id)||"";select.disabled=s.busy||!!s.active||pending;
+ const save=button("Save episode",()=>act("save",{id:d.id,task:select.value}));
+ save.disabled=save.disabled||!select.value;
+ select.onchange=()=>{selections.set(d.id,select.value);save.disabled=s.busy||!!s.active||pending||!select.value;};
+ label.append(select);row.append(label,save);}
  row.append(button("Discard",()=>{if(confirm("Discard this draft?"))act("discard",{id:d.id});},true));el("drafts").append(row);}
  if(!s.drafts.length)el("drafts").textContent="No episodes awaiting review.";
  el("episodes").replaceChildren();
- s.saved.forEach((d,i)=>{const tr=document.createElement("tr");for(const t of [`${i+1} · ${d.id.slice(0,8)}`,d.duration.toFixed(1)+" s",d.frames]){const td=document.createElement("td");td.textContent=t;tr.append(td);}
+ s.saved.forEach((d,i)=>{const tr=document.createElement("tr");for(const t of [`${i+1} · ${d.id.slice(0,8)}`,d.task,d.duration.toFixed(1)+" s",d.frames]){const td=document.createElement("td");td.textContent=t;tr.append(td);}
  const td=document.createElement("td");td.append(button("Delete",()=>{if(confirm("Move this saved episode to trash? Rebuild/upload to update the dataset."))act("delete",{id:d.id});},true));tr.append(td);el("episodes").append(tr);});
 }
 async function poll(){try{const r=await fetch("/api/state");if(!r.ok)throw Error("Server returned "+r.status);render(await r.json());

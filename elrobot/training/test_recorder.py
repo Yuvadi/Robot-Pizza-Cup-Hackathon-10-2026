@@ -16,7 +16,7 @@ from recorder import Recorder, create_app, decode, timers
 
 
 def options():
-    return SimpleNamespace(task="place cheese on pizza", repo="yaditya/place-cheese-on-pizza",
+    return SimpleNamespace(task="place cheese on pizza", repo="yaditya/place-toppings-on-pizza",
                            public=True, port=8890, bus_serial="FOLLOWER")
 
 
@@ -37,10 +37,10 @@ class RecordingTests(unittest.TestCase):
         self.stamp = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
         self.r.ingest(self.stamp, row())
 
-    def record(self):
+    def record(self, frames=3):
         self.r.start(2)
         identity = self.r.active["id"]
-        for i in range(3):
+        for i in range(frames):
             self.r.ingest(self.stamp + i * 100_000_000, row())
         self.r.stop()
         return identity
@@ -70,6 +70,38 @@ class RecordingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Fresh"):
             self.r.start(2)
 
+    def test_save_category_updates_all_frames_and_survives_restart(self):
+        for task in ("pick_and_place_salami", "pick_and_place_cheese"):
+            self.r.latest_stamp = self.stamp = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+            identity = self.record(frames=67)
+            source = self.r.root / "drafts" / identity / "frames.parquet"
+            before = pq.read_table(source).to_pylist()
+            self.r.manage("save", identity, task)
+            after = pq.read_table(self.r.root / "saved" / identity / "frames.parquet").to_pylist()
+            self.assertEqual(after, [frame | {"task": task} for frame in before])
+        other = Recorder(self.r.root, options())
+        self.assertEqual({episode["task"] for episode in other.records("saved")},
+                         {"pick_and_place_salami", "pick_and_place_cheese"})
+
+    def test_unknown_category_keeps_draft_unchanged(self):
+        identity = self.record()
+        for task in ("", "unknown", "../salami", 5):
+            with self.subTest(task=task), self.assertRaisesRegex(ValueError, "category"):
+                self.r.manage("save", identity, task)
+        self.assertEqual(self.r.records("saved"), [])
+        self.assertEqual(self.r.records("drafts")[0]["task"], options().task)
+
+    def test_failed_relabel_preserves_original_frames_and_draft(self):
+        identity = self.record()
+        source = self.r.root / "drafts" / identity
+        before = (source / "frames.parquet").read_bytes()
+        with patch("recorder.pq.ParquetWriter", side_effect=OSError("Disk write failed")), \
+                self.assertRaisesRegex(OSError, "Disk write failed"):
+            self.r.manage("save", identity, "pick_and_place_salami")
+        self.assertEqual((source / "frames.parquet").read_bytes(), before)
+        self.assertFalse((source / "frames.relabel.partial").exists())
+        self.assertEqual(self.r.records("saved"), [])
+
     def test_failed_episode_cannot_be_saved(self):
         self.r.start(2)
         identity = self.r.active["id"]
@@ -96,7 +128,7 @@ class RecordingTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.r.manage("delete", identity)
 
-    def test_new_episode_cannot_mix_calibration_or_tasks(self):
+    def test_new_episode_cannot_mix_calibration(self):
         identity = self.record()
         self.r.manage("save", identity)
         self.r.latest_stamp = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
@@ -163,7 +195,8 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.r.records("drafts")[0]["status"], "review")
 
     async def test_converter_round_trip(self):
-        for _ in range(2):
+        categories = ("pick_and_place_salami", "pick_and_place_cheese")
+        for category in categories:
             self.stamp = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
             self.r.latest_stamp = self.stamp
             self.r.start(2)
@@ -171,7 +204,7 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
             for i in range(4):
                 self.r.ingest(self.stamp + i * 100_000_000, row())
             self.r.stop()
-            self.r.manage("save", identity)
+            self.r.manage("save", identity, category)
         result = await self.r.build()
         info = json.loads((result / "meta/info.json").read_text())
         self.assertEqual(info["total_episodes"], 2)
@@ -179,10 +212,14 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(info["fps"], 10)
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
         ds = LeRobotDataset("local/recorder-test", root=result, video_backend="pyav")
+        tasks = [json.loads(line)["task"] for line in (result / "meta/tasks.jsonl").read_text().splitlines()]
+        self.assertEqual(set(tasks), set(categories))
+        self.assertEqual(info["total_tasks"], 2)
+        self.assertEqual({ds[i]["task"] for i in range(len(ds))}, set(categories))
         sample = ds[0]
         self.assertEqual(tuple(sample["observation.images.camera_0"].shape), (3, 224, 224))
         self.assertEqual(tuple(sample["action"].shape), (8,))
-        self.assertEqual(sample["task"], options().task)
+        self.assertIn(sample["task"], categories)
 
     async def test_http_requires_token_and_blocks_invalid_requests(self):
         app = create_app(self.r)
@@ -208,6 +245,30 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 400)
         response = await client.post("/api/stop", json={}, headers=headers)
         self.assertEqual(response.status, 200)
+
+    async def test_http_save_requires_category_and_persists_selection(self):
+        self.r.start(2)
+        identity = self.r.active["id"]
+        for i in range(3):
+            self.r.ingest(self.stamp + i * 100_000_000, row())
+        self.r.stop()
+        app = create_app(self.r)
+        app.cleanup_ctx.clear()
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        self.addAsyncCleanup(client.close)
+        headers = {"Host": "localhost:8890", "X-Recorder-Token": self.r.token}
+        state = await (await client.get("/api/state", headers=headers)).json()
+        self.assertIn("pick_and_place_salami", state["categories"])
+        self.assertIn("pick_and_place_cheese", state["categories"])
+        for payload in ({"id": identity}, {"id": identity, "task": "unknown"},
+                        {"id": identity, "task": None}):
+            response = await client.post("/api/save", json=payload, headers=headers)
+            self.assertEqual(response.status, 400)
+        response = await client.post("/api/save", json={"id": identity, "task": "pick_and_place_salami"},
+                                     headers=headers)
+        self.assertEqual(response.status, 200)
+        self.assertEqual((await response.json())["saved"][0]["task"], "pick_and_place_salami")
 
 
 if __name__ == "__main__":
