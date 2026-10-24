@@ -17,6 +17,7 @@ Status: **Draft v0.1**.
 
 **Geometry + manipulation skeleton:** [Multi-Modal-Approach](Multi-Modal-Approach/README.md).
 **ElRobot manual calibration profiles:** [Calibration and backups](elrobot/docs/calibration.md).
+**ElRobot browser episode recorder:** [Recording UI](elrobot/docs/episode-recorder.md).
 
 ---
 

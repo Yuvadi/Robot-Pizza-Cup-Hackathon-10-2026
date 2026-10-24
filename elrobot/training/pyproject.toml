@@ -3,6 +3,7 @@ name = "elrobot-lerobot-training"
 version = "0.1.0"
 requires-python = "==3.12.*"
 dependencies = [
+    "aiohttp>=3.9,<4",
     "lerobot[smolvla]==0.3.3",
     "torch==2.7.1",
     "torchvision==0.22.1",
