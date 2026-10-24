@@ -168,7 +168,10 @@ uv run python follow.py \
 ```
 
 Default behavior is **prediction only**, with no robot writes. It rejects wrong
-dimensions, invalid/out-of-range actions, and calibration mismatches. It prints
+dimensions, non-finite actions, and calibration mismatches. Out-of-range
+predictions are reported per motor as `OUT OF RANGE` and blocked for execution,
+without clipping or converting them to motor targets. Execution rejects them.
+For predictions within [0, 1], it prints
 all eight current positions, predicted targets, and calibrated-arc deltas in ticks,
 marking movements over 100 ticks as `OVER LIMIT` and blocked for execution.
 Over-limit previews never send commands; execution still rejects these movements

@@ -118,6 +118,28 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.sender.assert_not_awaited()
         self.client.close_connection.assert_called_once()
 
+    async def test_out_of_range_dry_run_reports_without_converting_or_sending(self):
+        self.prediction.return_value = [0.5, -0.0084, 0.5, 1.0075, 0.5, 0.5, 0.5, 0.5]
+        with patch("builtins.print") as output, patch("follow.goal_preview") as preview:
+            await follow.live(self.args, Mock())
+        lines = [str(call.args[0]) for call in output.call_args_list]
+        self.assertEqual(sum("OUT OF RANGE" in line for line in lines), 2)
+        self.assertTrue(any("BLOCKED for execution" in line for line in lines))
+        self.assertTrue(any("DRY RUN: no commands sent" in line for line in lines))
+        self.assertFalse(self.prediction.call_args.kwargs["strict"])
+        preview.assert_not_called()
+        self.sender.assert_not_awaited()
+        self.client.close_connection.assert_called_once()
+
+    async def test_execution_keeps_strict_prediction_validation(self):
+        self.args.execute = True
+        self.prediction.side_effect = ValueError("Predicted normalized goals outside [0, 1]")
+        with patch("builtins.input", return_value="MOVE FOLLOWER"), self.assertRaises(ValueError):
+            await follow.live(self.args, Mock())
+        self.assertTrue(self.prediction.call_args.kwargs["strict"])
+        self.sender.assert_not_awaited()
+        self.client.close_connection.assert_called_once()
+
     async def test_over_limit_dry_run_prints_all_motors_without_sending(self):
         self.prediction.return_value = [0.9] * 8
         with patch("builtins.print") as output:

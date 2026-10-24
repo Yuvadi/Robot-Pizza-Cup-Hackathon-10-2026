@@ -162,7 +162,15 @@ async def live(args, policy) -> None:
         frame = await fetch()
         batch, joints = decode_frame(frame, order)
         batch["task"] = [args.task]
-        action = predict(policy, batch)
+        action = predict(policy, batch, strict=args.execute)
+        if not args.execute and any(value < 0 or value > 1 for value in action):
+            print("motor  predicted_normalized  range_check")
+            for mid, value in zip(ids, action, strict=True):
+                status = "OUT OF RANGE" if value < 0 or value > 1 else "within range"
+                print(f"{mid:5d}  {value:20.6f}  {status}")
+            print("BLOCKED for execution: prediction outside [0, 1]; no clipping applied.")
+            print("DRY RUN: no commands sent. Invalid predictions are not converted to motor targets.")
+            return
         if args.execute:
             check_frame_age(frame)
         else:
