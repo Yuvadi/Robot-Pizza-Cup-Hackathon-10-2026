@@ -71,6 +71,41 @@ autonomous performance. Inspect the videos and hold out complete demonstrations
 when comparing models; the command above trains on all eight and does not report
 a held-out success score.
 
+### Experimental range-penalized fine-tuning
+
+For an existing Station-normalized checkpoint, `train.py` accepts `--policy-path`
+and the opt-in `--range-penalty-weight` (default 0 preserves the original loss).
+For example, from `elrobot/training`, with a verified local toppings export:
+
+```bash
+.venv/bin/python train.py \
+  --dataset yaditya/place-toppings-on-pizza \
+  --dataset-root /absolute/path/to/toppings-export \
+  --policy-path ../../toppings-smolvla-policy \
+  --output outputs/toppings-range-penalty \
+  --steps 5000 --batch-size 8 --range-penalty-weight 10
+```
+
+This is additional fine-tuning with a new optimizer, not a resume of an interrupted
+optimizer state. The original checkpoint is not overwritten. A sibling
+`<output>.training.json` records the input checkpoint, dataset, weight and command.
+The opt-in entrypoint changes only the training process, not installed LeRobot
+files or checkpoint inference behavior.
+
+The added loss is the weighted mean squared distance outside `[0, 1]` of the
+estimated clean action `x_t - t * predicted_velocity`, decoded using the
+checkpoint's action mean/std. Only real action dimensions and non-padded episode
+steps contribute. The imitation loss is unchanged. This supports Station actions
+with MEAN_STD normalization, not ALOHA conversion. Weight 10 is an experimental
+starting value, not a validated setting. Loss components are logged every 20
+updates.
+
+This penalizes a single-time flow endpoint estimate, not the full multi-step
+inference trajectory. It does not guarantee bounded sampled outputs, collision
+avoidance, or successful picking. Compare checkpoints offline using fixed seeds
+and held-out episodes, checking both range violations and imitation error before
+supervised hardware evaluation. All runtime guards remain required.
+
 ### Demo cheese dataset (local v3 conversion)
 
 `n4chi/7-robopizzeria-cheese-v1` contains 10 demonstrations / 2,293 frames
