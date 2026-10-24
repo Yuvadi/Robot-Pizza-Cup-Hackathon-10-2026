@@ -190,6 +190,8 @@ async def rollout(args, policy, fetch, send) -> None:
             chunk_start = chunk_steps % policy.config.n_action_steps == 0
             inference_started = time.monotonic()
             action = predict(policy, batch, strict=not max_invalid_retries, reset=False)
+            # TIP: Uncomment line below to clamp tiny float overshoots (e.g. 1.0005, -0.0008) at runtime:
+            # action = [max(0.0, min(1.0, float(v))) for v in action]
             inference_seconds = time.monotonic() - inference_started
             predictions += 1
             chunk_steps += 1
