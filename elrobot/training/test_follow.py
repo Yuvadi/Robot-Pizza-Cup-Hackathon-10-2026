@@ -13,6 +13,26 @@ from safety import Joint
 
 
 class PredictionTests(unittest.TestCase):
+    def test_rollout_cli_accepts_long_durations_without_loading_policy(self):
+        with tempfile.TemporaryDirectory() as root:
+            (Path(root) / "config.json").touch()
+            for duration in ("100", "150", "1000"):
+                with self.subTest(duration=duration), \
+                        patch("sys.argv", ["follow.py", "--checkpoint", root, "--execute",
+                                           "--rollout-seconds", duration]), \
+                        patch("follow.torch.cuda.is_available", return_value=False), \
+                        self.assertRaisesRegex(RuntimeError, "CUDA is required"):
+                    follow.main()
+
+    def test_rollout_cli_rejects_invalid_durations(self):
+        for duration in ("nan", "inf", "-inf", "-1"):
+            with self.subTest(duration=duration), \
+                    patch("sys.argv", ["follow.py", "--checkpoint", ".", "--execute",
+                                       f"--rollout-seconds={duration}"]), \
+                    patch("sys.stderr"), self.assertRaises(SystemExit) as error:
+                follow.main()
+            self.assertEqual(error.exception.code, 2)
+
     def test_retry_cli_rejects_invalid_limits_and_nonrollout_modes(self):
         for options in (
             ["--max-invalid-retries", "-1"],
@@ -110,6 +130,26 @@ class RolloutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.policy.reset.call_count, 2)
         self.assertEqual(self.policy.config.n_action_steps, 50)
         self.assertEqual(self.policy.select_action.call_count, self.send.await_count)
+
+    async def test_long_duration_preserves_deadline(self):
+        for duration in (100, 150):
+            with self.subTest(duration=duration):
+                self.args.rollout_seconds = duration
+                self.send.reset_mock()
+                with patch("follow.time.monotonic",
+                           side_effect=[0, 0, 0, 0, 0, duration]):
+                    await follow.rollout(self.args, self.policy, self.fetch, self.send)
+                self.send.assert_not_awaited()
+                self.assertEqual(self.policy.config.n_action_steps, 50)
+
+    async def test_invalid_duration_never_fetches_or_sends(self):
+        for duration in (0, -1, float("nan"), float("inf"), -float("inf")):
+            with self.subTest(duration=duration):
+                self.args.rollout_seconds = duration
+                with self.assertRaisesRegex(ValueError, "positive finite"):
+                    await follow.rollout(self.args, self.policy, self.fetch, self.send)
+                self.fetch.assert_not_awaited()
+                self.send.assert_not_awaited()
 
     async def test_invalid_prediction_never_sends(self):
         self.policy.select_action.return_value[0, 1] = -.01
@@ -316,7 +356,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_rollout_warmup_discards_output_and_cache_before_refetch(self):
         self.args.execute = True
-        self.args.rollout_seconds = 20
+        self.args.rollout_seconds = 150
         policy = Mock()
 
         def warmup(*args, **kwargs):
@@ -333,7 +373,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.client.read_from_tail.call_count, 2)
             self.sender.assert_not_awaited()
 
-        with patch("builtins.input", return_value="ROLLOUT FOLLOWER 20"), \
+        with patch("builtins.input", return_value="ROLLOUT FOLLOWER 150"), \
                 patch("follow.rollout", side_effect=run) as rollout:
             await follow.live(self.args, policy)
         self.assertFalse(self.prediction.call_args.kwargs["strict"])

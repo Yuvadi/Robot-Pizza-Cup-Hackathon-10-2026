@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import io
 import logging
+import math
 import sys
 import time
 from pathlib import Path
@@ -154,8 +155,8 @@ def rollout_goals(action, joints, max_delta, previous_targets, ids, phase):
 
 async def rollout(args, policy, fetch, send) -> None:
     """Bounded rollout; callbacks supply telemetry and send validated targets."""
-    if not args.execute or not 0 < args.rollout_seconds <= 20:
-        raise ValueError("Rollout requires --execute and a duration in (0, 20].")
+    if not args.execute or not math.isfinite(args.rollout_seconds) or args.rollout_seconds <= 0:
+        raise ValueError("Rollout requires --execute and a positive finite duration.")
     max_invalid_retries = getattr(args, "max_invalid_retries", 0)
     if not 0 <= max_invalid_retries <= 3:
         raise ValueError("--max-invalid-retries must be in 0..3.")
@@ -244,12 +245,14 @@ async def live(args, policy) -> None:
     config = yaml.safe_load(args.station_config.read_text())
     verify_station_config(config, args.bus_serial, args.queue)
     duration = getattr(args, "rollout_seconds", 0)
+    if not math.isfinite(duration) or duration < 0:
+        raise ValueError("--rollout-seconds must be finite and nonnegative.")
     max_invalid_retries = getattr(args, "max_invalid_retries", 0)
     if not 0 <= max_invalid_retries <= 3 or (max_invalid_retries and not duration):
         raise ValueError("--max-invalid-retries must be 0..3; nonzero requires a rollout.")
     if duration:
-        if not args.execute or not 0 < duration <= 20:
-            raise ValueError("Rollout requires --execute and a duration in (0, 20].")
+        if not args.execute:
+            raise ValueError("Rollout requires --execute and a positive finite duration.")
         print(f"ROLLOUT: up to {duration:g} seconds. Stop mirroring, other policies, and recording.")
         print("Clear the workspace; keep the physical stop accessible. Ctrl+C stops NEW commands only.")
         print("Torque is not changed. At most 10 commands/second; chunks limited to 10 actions.")
@@ -384,7 +387,7 @@ def main() -> None:
     )
     parser.add_argument("--execute", action="store_true", help="Explicitly permit ONE send after interactive confirmation.")
     parser.add_argument("--rollout-seconds", type=float, default=0,
-                        help="With --execute: bounded rollout for up to 20 seconds instead of one send.")
+                        help="With --execute: positive finite rollout duration in seconds; 0 means one send.")
     parser.add_argument(
         "--max-invalid-retries", type=int, default=0,
         help="Rollout only: retry out-of-range actions up to 3 consecutive times (default: 0, abort).",
@@ -392,8 +395,9 @@ def main() -> None:
     args = parser.parse_args()
     if args.offline and args.execute:
         parser.error("--offline cannot be combined with --execute.")
-    if not 0 <= args.rollout_seconds <= 20 or (args.rollout_seconds and (args.offline or not args.execute)):
-        parser.error("--rollout-seconds must be 0..20 and nonzero requires live --execute.")
+    if (not math.isfinite(args.rollout_seconds) or args.rollout_seconds < 0
+            or (args.rollout_seconds and (args.offline or not args.execute))):
+        parser.error("--rollout-seconds must be finite and nonnegative; nonzero requires live --execute.")
     if not 0 <= args.max_invalid_retries <= 3 or (args.max_invalid_retries and not args.rollout_seconds):
         parser.error("--max-invalid-retries must be 0..3; nonzero requires --rollout-seconds.")
     if not 1 <= args.max_delta_ticks <= MAX_DELTA_TICKS:

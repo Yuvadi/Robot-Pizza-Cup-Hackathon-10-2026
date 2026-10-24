@@ -134,7 +134,11 @@ beside its recorded action. It is a wiring check, not a task-success evaluation.
 #### Optional bounded policy rollout
 
 The default `--execute` path still sends only one target. To test a policy over
-time, additionally pass `--rollout-seconds 20` (maximum 20 seconds). For example,
+time, additionally pass `--rollout-seconds 20`. Any explicitly supplied positive,
+finite duration is accepted, including `100` or `150`; there is no fixed upper
+cap. Omitting the option (or specifying `0`) retains the single-send behavior.
+The confirmation phrase includes the requested duration. Longer runs require
+continuous supervision and do not add a hardware watchdog. For example,
 from `elrobot/training`:
 
 ```bash
@@ -200,6 +204,15 @@ joint slot, raw position, calibration endpoints, and distance outside the arc.
 Do not widen calibration or clamp telemetry merely to suppress this error.
 Check the physical pose and calibration through the supported manual workflow
 before another policy attempt.
+
+Policy outputs are absolute targets in the dataset's `[0, 1]` calibrated-arc
+coordinates, not signed movement deltas or degrees. The checkpoint's mean/std
+action normalization is reversed inside `select_action` before the bridge
+receives the prediction. Negative returned values therefore fall below the
+calibrated minimum; they are not requests to rotate backward. Encoder wraparound
+is already supported when the calibrated arc crosses raw encoder zero, but this
+does not make the normalized endpoints interchangeable or permit crossing a
+mechanical stop. Do not modulo-wrap an out-of-range normalized prediction.
 
 Ctrl+C stops new commands once control returns from any in-flight inference.
 There is no independent hardware watchdog or collision detection. The process
