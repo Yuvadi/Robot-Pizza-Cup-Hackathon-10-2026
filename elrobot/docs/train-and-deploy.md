@@ -166,6 +166,28 @@ beside its recorded action. It is a wiring check, not a task-success evaluation.
 
 ### Live follower dry run
 
+#### ACT checkpoints with external processors
+
+The bridge also recognizes `"type": "act"` checkpoints using the external
+MEAN_STD processors supported by `act_checkpoint.py`. It validates processor
+ordering, statistics, and supported configuration fields, then loads every model
+weight strictly into the installed ACT architecture. It does not modify the
+checkpoint or download backbone weights. Unsupported formats fail explicitly.
+The same prediction, calibration, freshness, movement and confirmation guards
+apply. Rollouts still execute at most 10 actions before replanning.
+
+ACT is not language-conditioned: `--task pick_and_place_cheese` labels/checks the
+requested dataset task but does not teach or select cheese behavior in ACT.
+Camera framing, calibration, joint mapping and training behavior must match.
+Test without hardware first, quoting the checkpoint path if it contains spaces:
+
+```bash
+.venv/bin/python follow.py --checkpoint "../../ACT Model" \
+  --dataset yaditya/place-toppings-on-pizza \
+  --dataset-root /absolute/path/to/toppings-export \
+  --task pick_and_place_cheese --offline --samples 20
+```
+
 #### Optional bounded policy rollout
 
 The default `--execute` path still sends only one target. To test a policy over

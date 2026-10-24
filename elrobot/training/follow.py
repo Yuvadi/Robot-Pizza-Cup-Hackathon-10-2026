@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import io
+import json
 import logging
 import math
 import sys
@@ -191,7 +192,7 @@ async def rollout(args, policy, fetch, send) -> None:
             inference_started = time.monotonic()
             action = predict(policy, batch, strict=not max_invalid_retries, reset=False)
             # TIP: Uncomment line below to clamp tiny float overshoots (e.g. 1.0005, -0.0008) at runtime:
-            # action = [max(0.0, min(1.0, float(v))) for v in action]
+            #action = [max(0.0, min(1.0, float(v))) for v in action]
             inference_seconds = time.monotonic() - inference_started
             predictions += 1
             chunk_steps += 1
@@ -412,7 +413,15 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required in this WSL environment.")
     logging.basicConfig(level=logging.WARNING)
-    policy = SmolVLAPolicy.from_pretrained(str(args.checkpoint)).to("cuda").eval()
+    policy_type = json.loads((args.checkpoint / "config.json").read_text()).get("type")
+    if policy_type == "act":
+        from act_checkpoint import load_act_checkpoint
+
+        policy = load_act_checkpoint(args.checkpoint).to("cuda").eval()
+    elif policy_type == "smolvla":
+        policy = SmolVLAPolicy.from_pretrained(str(args.checkpoint)).to("cuda").eval()
+    else:
+        parser.error(f"Unsupported checkpoint policy type: {policy_type!r}")
     validate_policy(policy)
     if args.offline:
         offline(args, policy)

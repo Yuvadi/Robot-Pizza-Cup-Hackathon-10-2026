@@ -16,6 +16,18 @@ all policy processes. From `elrobot/training` in WSL:
 
 Open <http://localhost:8890> in your Windows browser.
 
+For a separate v2 collection, stop the previous recorder and launch:
+
+```bash
+.venv/bin/python recorder.py \
+  --root ../../data/topping-on-pizza-v2 \
+  --repo yaditya/topping-on-pizza-v2 \
+  --dataset-name "Topping on Pizza v2"
+```
+
+This starts an independent collection without moving old recordings. Uploads
+remain private by default and require explicit confirmation in the UI.
+
 The default recording task is **pick_and_place_cheese**. After each recording,
 choose **pick_and_place_salami** or **pick_and_place_cheese** when saving.
 An explicit `--task` is also offered as an additional category for compatibility

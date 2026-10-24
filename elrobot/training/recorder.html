@@ -20,7 +20,7 @@ button.danger{background:#773b43}button:disabled{opacity:.4;cursor:not-allowed}i
 </style>
 </head>
 <body>
-<h1>Place Toppings on Pizza</h1>
+<h1 id="dataset-name">Place Toppings on Pizza</h1>
 <p>Record demonstrations, review episodes, and build a training dataset.</p>
 <div class="card warning">Read-only hardware access. This UI never enables torque, starts teleoperation, or sends motor commands.
 Operate the leader through Station. Stop recording before resetting the scene.</div>
@@ -71,6 +71,7 @@ function renderButtons(){if(!current)return;const busy=current.busy||pending, ac
 function upload(){if(!current)return;const visibility=current.public?"PUBLIC (anyone can download camera images and telemetry)":"PRIVATE";
  if(confirm(`Upload ${current.saved.length} saved episodes to ${current.repo} as ${visibility}?\nThis replaces the remote dataset files. Ensure everyone visible in the recordings consents.`))act("upload",{confirm_repo:current.repo});}
 function render(s){current=s;el("connection").textContent=s.connection+(s.fresh?"":" — STALE / recording disabled");
+ document.title=s.dataset_name;el("dataset-name").textContent=s.dataset_name;
  el("error").textContent=localError||s.error;el("task").textContent="Choose the category after each recording, before saving.";
  el("destination").textContent=`Destination: ${s.repo} • ${s.public?"Public":"Private"}`;
  el("timer").textContent=s.active?Math.max(0,s.active.timer-s.elapsed).toFixed(1)+" s remaining":"Ready";

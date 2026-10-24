@@ -91,6 +91,7 @@ class Recorder:
             "active": self.active, "saved": self.records("saved"), "drafts": self.records("drafts"),
             "busy": self.busy, "job": self.job_status, "export": str(self.export) if self.export else None,
             "task": self.args.task, "repo": self.args.repo, "public": self.args.public,
+            "dataset_name": getattr(self.args, "dataset_name", "Place Toppings on Pizza"),
             "categories": list(dict.fromkeys((*TASK_CATEGORIES, self.args.task))),
             "elapsed": (time.monotonic() - self.active["clock"]) if self.active else 0,
         }
@@ -408,12 +409,14 @@ def main() -> None:
     parser.add_argument("--task", default="pick_and_place_cheese",
                         help="Default task; also offered alongside salami/cheese when saving a draft.")
     parser.add_argument("--repo", default="yaditya/place-toppings-on-pizza")
+    parser.add_argument("--dataset-name", default="Place Toppings on Pizza",
+                        help="Dataset title displayed in the browser.")
     parser.add_argument("--public", action="store_true", help="Create public uploads; otherwise private.")
     parser.add_argument("--bus-serial", default="5B61032837")
     parser.add_argument("--port", type=int, default=8890)
     args = parser.parse_args()
-    if not args.task.strip() or not 1 <= args.port <= 65535:
-        parser.error("Non-empty task and valid port required.")
+    if not args.task.strip() or not args.dataset_name.strip() or not 1 <= args.port <= 65535:
+        parser.error("Non-empty task, dataset name and valid port required.")
     from huggingface_hub.utils import validate_repo_id
     validate_repo_id(args.repo)
     config = yaml.safe_load((ROOT / "elrobot/norma-core/bin/station.yaml").read_text())
