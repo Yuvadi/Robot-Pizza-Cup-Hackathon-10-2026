@@ -70,6 +70,67 @@ class RecordingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Fresh"):
             self.r.start(2)
 
+    def test_new_collection_exact_labels_and_persistent_settings(self):
+        with tempfile.TemporaryDirectory() as root:
+            args = options()
+            args.task = "pick-n-put-cheese"
+            args.categories = ["pick-n-put-cheese", "pick-n-put-salami"]
+            args.camera_order = "1,0"
+            args.fps = 15
+            args.image_size = 320
+            recorder = Recorder(Path(root), args)
+            self.assertEqual(recorder.state()["categories"], args.categories)
+            self.assertEqual(recorder.state()["camera_order"], [1, 0])
+            Recorder(Path(root), args)
+            args.camera_order = "0,1"
+            with self.assertRaisesRegex(ValueError, "settings changed"):
+                Recorder(Path(root), args)
+
+    def test_capture_gate_counts_unique_camera_timestamps_not_just_stream(self):
+        self.r.args.fps = 15
+        for i in range(46):
+            stamp = self.stamp + round(i * 1e9 / 15)
+            self.r.ingest(stamp, row(), [stamp, self.stamp])
+        self.assertFalse(self.r.capture_ready())
+        with patch.object(self.r, "fresh", return_value=True), \
+                self.assertRaisesRegex(ValueError, "Capture rate not ready"):
+            self.r.start(2)
+        self.r.samples.clear()
+        for i in range(46):
+            stamp = self.stamp + round(i * 1e9 / 15)
+            self.r.ingest(stamp, row(), [stamp, stamp])
+        self.assertTrue(self.r.capture_ready())
+        self.assertEqual(self.r.capture_rates(), [15., 15., 15.])
+        with patch.object(self.r, "fresh", return_value=True):
+            self.r.start(2)
+        self.r.stop()
+
+    def test_decoder_preserves_higher_resolution_and_reorders_camera_bytes(self):
+        image = io.BytesIO()
+        Image.new("RGB", (426, 320), (0, 50, 100)).save(image, format="JPEG")
+        original = row()
+        joints = []
+        for values in original["joints"]:
+            joint = Mock()
+            joint.get_monotonic_stamp_ns.return_value = self.stamp
+            for key, value in values.items():
+                getattr(joint, "get_" + key).return_value = value
+            joints.append(joint)
+        cameras = [Mock(), Mock()]
+        blobs = [image.getvalue(), image.getvalue() + b"extra"]
+        for camera, blob in zip(cameras, blobs):
+            camera.get_jpeg.return_value = blob
+            camera.get_monotonic_stamp_ns.return_value = self.stamp
+        frame = Mock()
+        frame.get_joints.return_value = joints
+        frame.get_images.return_value = cameras
+        frame.get_monotonic_stamp_ns.return_value = self.stamp
+        frame.get_global_frame_id.return_value = b"frame"
+        _, decoded = decode(frame, self.stamp, (1, 0), 320)
+        self.assertEqual(decoded["images"], [{"jpeg": blobs[1]}, {"jpeg": blobs[0]}])
+        with self.assertRaisesRegex(ValueError, "shortest side"):
+            decode(frame, self.stamp, (1, 0), 224)
+
     def test_save_category_updates_all_frames_and_survives_restart(self):
         for task in ("pick_and_place_salami", "pick_and_place_cheese"):
             self.r.latest_stamp = self.stamp = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
@@ -133,7 +194,7 @@ class RecordingTests(unittest.TestCase):
         self.r.manage("save", identity)
         self.r.latest_stamp = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
         self.r.latest["joints"][0]["range_max"] += 1
-        with self.assertRaisesRegex(ValueError, "differs"):
+        with self.assertRaisesRegex(ValueError, "differ"):
             self.r.start(2)
 
     def test_decoder_checks_freshness_and_joint_goals(self):
@@ -220,6 +281,38 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tuple(sample["observation.images.camera_0"].shape), (3, 224, 224))
         self.assertEqual(tuple(sample["action"].shape), (8,))
         self.assertIn(sample["task"], categories)
+
+    async def test_high_resolution_15fps_round_trip_and_training_preflight(self):
+        args = options()
+        args.task = "pick-n-put-cheese"
+        args.categories = ["pick-n-put-cheese", "pick-n-put-salami"]
+        args.camera_order, args.fps, args.image_size = "1,0", 15, 320
+        self.r = Recorder(self.r.root / "new", args)
+        blob = io.BytesIO()
+        Image.new("RGB", (426, 320), (50, 100, 150)).save(blob, format="JPEG")
+        data = row()
+        data["images"] = [{"jpeg": blob.getvalue()} for _ in range(2)]
+        base = time.clock_gettime_ns(time.CLOCK_BOOTTIME) - 3_000_000_000
+        for i in range(46):
+            stamp = base + round(i * 1e9 / 15)
+            self.r.ingest(stamp, data, [stamp, stamp])
+        with patch.object(self.r, "fresh", return_value=True):
+            self.r.start(2)
+        identity = self.r.active["id"]
+        for i in range(4):
+            stamp = base + 3_000_000_000 + round(i * 1e9 / 15)
+            self.r.ingest(stamp, data, [stamp, stamp])
+        self.r.stop()
+        self.r.manage("save", identity, "pick-n-put-salami")
+        result = await self.r.build()
+        info = json.loads((result / "meta/info.json").read_text())
+        self.assertEqual(info["fps"], 15)
+        self.assertEqual(info["total_frames"], 4)
+        self.assertEqual(info["features"]["observation.images.camera_0"]["shape"], [320, 426, 3])
+        profile = json.loads((result / "meta/collection.json").read_text())
+        self.assertEqual(profile["camera_order"], [1, 0])
+        from train import check_dataset
+        check_dataset("local/new-toppings-test", result)
 
     async def test_http_requires_token_and_blocks_invalid_requests(self):
         app = create_app(self.r)

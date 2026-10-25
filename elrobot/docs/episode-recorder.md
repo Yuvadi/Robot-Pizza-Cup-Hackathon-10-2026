@@ -28,6 +28,81 @@ For a separate v2 collection, stop the previous recorder and launch:
 This starts an independent collection without moving old recordings. Uploads
 remain private by default and require explicit confirmation in the UI.
 
+### New place-toppings-on-pizza collection (10 FPS / 224x224)
+
+This profile is separate from all previous recordings. With arms supported and
+controllers/recording stopped, run Station from `elrobot/norma-core/bin` with
+`./station --config station.yaml --web --tcp`.
+Never run two Station instances against the same buses. The collection uses
+10 FPS because the experimental 15 FPS setup caused synchronization issues.
+
+Then, from `elrobot/training`, launch the read-only recorder:
+
+```bash
+.venv/bin/python recorder.py \
+  --root ../../data/place-toppings-on-pizza \
+  --repo yaditya/place-toppings-on-pizza \
+  --dataset-name place-toppings-on-pizza \
+  --task pick-n-put-cheese \
+  --categories pick-n-put-cheese pick-n-put-salami \
+  --camera-order 1,0 --fps 10 --image-size 224 \
+  --station-config ../norma-core/bin/station.yaml \
+  --port 8891
+```
+
+Open <http://localhost:8891>. Dataset `camera_0` now contains Station camera 1;
+dataset `camera_1` contains Station camera 0. Previews reflect the saved order.
+Record only after visually confirming both views, since Station indices do not
+identify physical cameras and may change on reconnect.
+
+Station's synchronized normvla stream remains 224x224; increasing the USB resize
+target alone would not change it. No Station rebuild is needed for this profile.
+The page reports measured stream and unique-camera
+timestamp rates. Recording is blocked until at least two seconds of measurements
+meet 90% of the requested FPS for the stream AND each camera. A rate failure
+during recording invalidates the draft. This tests new source timestamps, not
+whether each image's pixels changed.
+
+`collection.json` freezes capture order, size, FPS, categories and follower for
+the root, and is copied into each export's `meta/`. Changing these settings
+requires a new root. Old datasets are not relabelled or remapped. Exports use the
+requested FPS without resizing camera images; export FPS is not a substitute
+for adequate source capture. The UI preview refresh rate is not the capture rate.
+
+Uploads are private by default and explicit. **The destination name matches an
+older Hub dataset**: uploading replaces its managed current dataset contents,
+not just adds a new local collection. Choose another `--repo` to preserve that
+remote version. Starting this page does not upload anything.
+
+Train a fresh model using the new export with the corrected `train.py`.
+When deploying that NEW model, use `--camera-order 1,0 --control-fps 10` and
+`station.yaml`. The follower requires images to match checkpoint dimensions
+exactly; it never resizes an old model's input silently. Old 10 FPS checkpoints
+still require 10 FPS execution; their image resolution remains compatible.
+
+### Demonstration quality checklist
+
+- Fix both cameras, verify their named views before each session, and keep the
+  gripper, pickup area and pizza visible through approach, grip and release.
+  A camera swap at inference changes the input distribution; correct this before
+  drawing conclusions about model quality.
+- Freeze calibration and joint order. Do not reopen range calibration midway
+  through a collection. Keep images, positions and actual commanded goals aligned.
+- Record one clean pickup, lift, transport and release per episode. Begin just
+  before purposeful motion and stop soon after release. Avoid long idle prefixes,
+  repeated rest poses, failed grasps, resets, collisions and hand occlusions.
+- Demonstrate smooth, deliberate motion at a repeatable pace, with clear gripper
+  open/close transitions. Review videos and reject jittery or unsuccessful trials.
+- Balance cheese and salami demonstrations. Vary pickup/placement positions and
+  orientations within the intended workspace while preserving a consistent task
+  strategy. Collect more successful examples where evaluation fails rather than
+  merely increasing training steps.
+- Reserve complete episodes and scenes for evaluation; adjacent frames from the
+  training demonstrations are not held-out evidence.
+- Higher resolution can help small-object visibility but increases processing
+  and storage. Higher FPS only helps if fresh camera capture, telemetry, training
+  timing and execution cadence all support it. Neither guarantees less jitter.
+
 The default recording task is **pick_and_place_cheese**. After each recording,
 choose **pick_and_place_salami** or **pick_and_place_cheese** when saving.
 An explicit `--task` is also offered as an additional category for compatibility
@@ -65,7 +140,8 @@ episodes retain their original labels; they are not automatically reclassified.
 
 Recordings use bounded 32-frame Parquet row groups, not an entire in-memory
 episode. State, goal actions, source frame IDs, JPEGs, and source-relative
-timestamps remain aligned. Raw camera dimensions must be 224x224, and normalized
+timestamps remain aligned. By default raw camera dimensions must have a 224-pixel
+shortest side (override with `--image-size`), and normalized
 states/actions must be in [0,1]. A gap over 0.5 seconds, stale sensors,
 calibration change, or connection loss invalidates the active draft. Invalid or
 interrupted drafts cannot be saved. Retrying the connection never resumes them.
@@ -92,7 +168,7 @@ delete Station history or remote data. Disk cleanup is manual. Restarted
 recordings cannot resume; interrupted drafts are marked invalid.
 
 **Build / save LeRobot dataset** converts all saved episodes into a fresh v2.1
-snapshot at 10 FPS, with two H.264 videos per episode. It uses
+snapshot at `--fps` (default 10), with two H.264 videos per episode. It uses
 `transform_elrobot.py`, preserving normalized source goals without action shifts.
 The combined export includes both categories in `meta/tasks.jsonl`, with each
 episode/frame assigned the corresponding task index; separate exports or folder

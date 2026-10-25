@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.utils import dataset_to_policy_features
 
 
 def check_dataset(repo_id: str, root: Path | None = None) -> None:
@@ -29,19 +30,23 @@ def check_dataset(repo_id: str, root: Path | None = None) -> None:
     expected = ["observation.images.camera_0", "observation.images.camera_1"]
     if cameras != expected:
         raise ValueError(f"Expected cameras in order {expected}, got {cameras}.")
-    if info["fps"] != 10:
-        raise ValueError("Expected the Station dataset's 10 FPS timing.")
+    if not isinstance(info["fps"], int) or not 1 <= info["fps"] <= 30:
+        raise ValueError("Expected integer capture timing in 1..30 FPS.")
     sample = dataset[0]
+    features = dataset_to_policy_features(info["features"])
     for key in expected:
-        if tuple(sample[key].shape) != (3, 224, 224):
-            raise ValueError(f"{key}: expected decoded RGB tensor (3, 224, 224).")
+        shape = tuple(features[key].shape)
+        if (len(shape) != 3 or shape[0] != 3 or min(shape[1:]) < 32
+                or tuple(sample[key].shape) != shape):
+            raise ValueError(f"{key}: decoded RGB tensor must match metadata shape {shape}.")
     print(
         f"Dataset: {repo_id}, {info['total_episodes']} episodes, "
         f"{info['total_frames']} frames, {info['fps']} FPS",
         flush=True,
     )
     print(f"Tasks: {dataset.meta.tasks}", flush=True)
-    print(f"Decoded cameras: {cameras}; 8 state and action values.", flush=True)
+    print(f"Decoded camera shapes: {[tuple(sample[k].shape) for k in cameras]}; "
+          "8 state and action values.", flush=True)
 
 
 def main() -> None:

@@ -11,6 +11,7 @@ import secrets
 import sys
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 
 import pyarrow as pa
@@ -41,7 +42,7 @@ def atomic_json(path: Path, data: dict) -> None:
     temporary.replace(path)
 
 
-def decode(frame, now_ns: int) -> tuple[int, dict]:
+def decode(frame, now_ns: int, camera_order=(0, 1), image_size=224) -> tuple[int, dict]:
     joints, images = frame.get_joints(), frame.get_images()
     if len(joints) != 8 or len(images) != 2:
         raise ValueError("Need exactly 8 follower joints and 2 cameras.")
@@ -52,11 +53,11 @@ def decode(frame, now_ns: int) -> tuple[int, dict]:
         span(Joint(value["position"], value["position_norm"], value["range_min"], value["range_max"]))
         if not math.isfinite(value["goal_norm"]) or not 0 <= value["goal_norm"] <= 1:
             raise ValueError("Recorded goal is outside [0, 1]; check calibration.")
-    blobs = [bytes(image.get_jpeg()) for image in images]
+    blobs = [bytes(images[index].get_jpeg()) for index in camera_order]
     for blob in blobs:
         with Image.open(io.BytesIO(blob)) as image:
-            if image.size != (224, 224):
-                raise ValueError(f"Expected training images 224x224, got {image.size}.")
+            if min(image.size) != image_size or any(size % 2 for size in image.size):
+                raise ValueError(f"Expected even camera dimensions with shortest side {image_size}, got {image.size}.")
             image.verify()
     identity = bytes(frame.get_global_frame_id())
     if not identity:
@@ -81,6 +82,38 @@ class Recorder:
         self.job_status = ""
         self.export = None
         self.token = secrets.token_urlsafe(32)
+        self.camera_order = [int(v) for v in getattr(args, "camera_order", "0,1").split(",")]
+        self.categories = tuple(getattr(args, "categories", None) or
+                                dict.fromkeys((*TASK_CATEGORIES, args.task)))
+        self.samples = deque(maxlen=180)
+        profile = {
+            "camera_order": self.camera_order, "fps": getattr(args, "fps", 10),
+            "image_size": getattr(args, "image_size", 224), "categories": list(self.categories),
+            "follower_serial": args.bus_serial,
+        }
+        profile_path = self.root / "collection.json"
+        if profile_path.exists():
+            if json.loads(profile_path.read_text()) != profile:
+                raise ValueError("Collection settings changed. Restore its settings or use a new --root.")
+        elif self.records("saved") or self.records("drafts"):
+            if (self.camera_order != [0, 1] or profile["fps"] != 10 or profile["image_size"] != 224):
+                raise ValueError("Cannot apply new capture settings to existing episodes. Use a new --root.")
+            atomic_json(profile_path, profile)
+        else:
+            atomic_json(profile_path, profile)
+
+    def capture_rates(self) -> list[float]:
+        if len(self.samples) < 2:
+            return [0., 0., 0.]
+        elapsed = (self.samples[-1][0] - self.samples[0][0]) / 1e9
+        if elapsed <= 0:
+            return [0., 0., 0.]
+        return [(len({sample[i] for sample in self.samples}) - 1) / elapsed for i in range(3)]
+
+    def capture_ready(self) -> bool:
+        return (len(self.samples) >= 2
+                and self.samples[-1][0] - self.samples[0][0] >= 2_000_000_000
+                and min(self.capture_rates()) >= getattr(self.args, "fps", 10) * .9)
 
     def records(self, category: str) -> list[dict]:
         return [json.loads(p.read_text()) for p in sorted((self.root / category).glob("*/episode.json"))]
@@ -92,7 +125,11 @@ class Recorder:
             "busy": self.busy, "job": self.job_status, "export": str(self.export) if self.export else None,
             "task": self.args.task, "repo": self.args.repo, "public": self.args.public,
             "dataset_name": getattr(self.args, "dataset_name", "Place Toppings on Pizza"),
-            "categories": list(dict.fromkeys((*TASK_CATEGORIES, self.args.task))),
+            "categories": list(self.categories),
+            "camera_order": self.camera_order,
+            "fps": getattr(self.args, "fps", 10),
+            "image_size": getattr(self.args, "image_size", 224),
+            "capture_rates": self.capture_rates(), "capture_ready": self.capture_ready(),
             "elapsed": (time.monotonic() - self.active["clock"]) if self.active else 0,
         }
 
@@ -109,11 +146,18 @@ class Recorder:
             raise ValueError("Episode timer must be an integer from 2 to 300 seconds.")
         if not self.fresh():
             raise ValueError("Fresh synchronized cameras/joints required. Check Station and teleoperation.")
+        if hasattr(self.args, "fps") and not self.capture_ready():
+            raise ValueError("Capture rate not ready: need at least 2 seconds at 90% of target "
+                             f"{self.args.fps} FPS for the stream AND both cameras. "
+                             f"Measured rates: {self.capture_rates()}. Check camera capture/Station.")
         calibration = [[j["range_min"], j["range_max"]] for j in self.latest["joints"]]
         for episode in self.records("saved"):
             if (episode["calibration"] != calibration
-                    or episode["follower_serial"] != self.args.bus_serial):
-                raise ValueError("Follower or calibration differs from saved episodes. Use a new --root.")
+                    or episode["follower_serial"] != self.args.bus_serial
+                    or episode["camera_order"] != self.camera_order
+                    or episode.get("fps", 10) != getattr(self.args, "fps", 10)
+                    or episode.get("image_size", 224) != getattr(self.args, "image_size", 224)):
+                raise ValueError("Follower, calibration or capture settings differ from saved episodes. Use a new --root.")
         identity = uuid.uuid4().hex
         folder = self.root / "drafts" / identity
         folder.mkdir()
@@ -121,7 +165,8 @@ class Recorder:
             "id": identity, "task": self.args.task, "started_ns": time.time_ns(),
             "timer": seconds, "frames": 0, "duration": 0, "status": "recording",
             "follower_serial": self.args.bus_serial, "motor_ids": list(range(1, 9)),
-            "camera_order": [0, 1], "calibration": calibration,
+            "camera_order": self.camera_order, "calibration": calibration,
+            "fps": getattr(self.args, "fps", 10), "image_size": getattr(self.args, "image_size", 224),
         }
         self.writer = pq.ParquetWriter(folder / "frames.partial", SCHEMA, compression="zstd")
         atomic_json(folder / "episode.json", metadata)
@@ -129,10 +174,15 @@ class Recorder:
         self.buffer = []
         self.error = ""
 
-    def ingest(self, stamp: int, row: dict) -> None:
+    def ingest(self, stamp: int, row: dict, camera_stamps=None) -> None:
         self.latest, self.latest_stamp = row, stamp
+        if camera_stamps is not None:
+            self.samples.append((stamp, *camera_stamps))
         if not self.active:
             return
+        if hasattr(self.args, "fps") and not self.capture_ready():
+            raise ValueError(f"Capture rate fell below 90% of {self.args.fps} FPS; "
+                             f"stream/camera rates: {self.capture_rates()}. Discard and check capture.")
         a = self.active
         if a["last_stamp"] is not None and stamp <= a["last_stamp"]:
             raise ValueError("Duplicate or reversed recording timestamp.")
@@ -185,7 +235,7 @@ class Recorder:
         metadata = json.loads((source / "episode.json").read_text())
         if action == "save":
             selected_task = self.args.task if task is None else task
-            if selected_task not in (*TASK_CATEGORIES, self.args.task):
+            if selected_task not in self.categories:
                 raise ValueError("Choose a supported episode category.")
             if metadata["status"] not in ("review", "saved"):
                 raise ValueError("Only completed, valid episodes can be saved. Discard interrupted recordings.")
@@ -227,7 +277,7 @@ class Recorder:
         self.job_status = "Converting saved episodes to LeRobot v2.1..."
         process = await asyncio.create_subprocess_exec(
             sys.executable, str(ROOT / "transform_elrobot.py"), str(self.root / "saved"), str(output),
-            "--fps", "10", "--robot-type", "elrobot",
+            "--fps", str(getattr(self.args, "fps", 10)), "--robot-type", "elrobot",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         )
         data, _ = await process.communicate()
@@ -237,6 +287,7 @@ class Recorder:
         info = json.loads((output / "meta/info.json").read_text())
         if info["total_episodes"] != len(self.records("saved")):
             raise ValueError("Converted episode count does not match saved episodes.")
+        atomic_json(output / "meta/collection.json", json.loads((self.root / "collection.json").read_text()))
         self.export = output
         return output
 
@@ -292,11 +343,13 @@ async def station(recorder: Recorder) -> None:
                 if entry is None:
                     raise RuntimeError(f"Station stream ended: {reader.err}")
                 frame = normvla.FrameReader(entry.Data)
-                stamp, row = decode(frame, time.clock_gettime_ns(time.CLOCK_BOOTTIME))
+                stamp, row = decode(frame, time.clock_gettime_ns(time.CLOCK_BOOTTIME),
+                                    recorder.camera_order, getattr(recorder.args, "image_size", 224))
                 if stamp == last:
                     continue
                 last = stamp
-                recorder.ingest(stamp, row)
+                recorder.ingest(stamp, row, [frame.get_images()[i].get_monotonic_stamp_ns()
+                                            for i in recorder.camera_order])
                 recorder.connection = "Connected: synchronized follower + two cameras (read-only)"
         except asyncio.CancelledError:
             raise
@@ -306,6 +359,7 @@ async def station(recorder: Recorder) -> None:
             if recorder.active:
                 recorder.stop(str(exc))
         finally:
+            recorder.samples.clear()
             if client:
                 client.close_connection()
             owned = [
@@ -414,12 +468,23 @@ def main() -> None:
     parser.add_argument("--public", action="store_true", help="Create public uploads; otherwise private.")
     parser.add_argument("--bus-serial", default="5B61032837")
     parser.add_argument("--port", type=int, default=8890)
+    parser.add_argument("--categories", nargs="+", help="Exact task choices offered when saving.")
+    parser.add_argument("--camera-order", choices=("0,1", "1,0"), default="0,1")
+    parser.add_argument("--fps", type=int, default=10, help="Required fresh capture and export FPS (1..30).")
+    parser.add_argument("--image-size", type=int, default=224, help="Expected shortest image side, in pixels.")
+    parser.add_argument("--station-config", type=Path, default=ROOT / "elrobot/norma-core/bin/station.yaml")
     args = parser.parse_args()
     if not args.task.strip() or not args.dataset_name.strip() or not 1 <= args.port <= 65535:
         parser.error("Non-empty task, dataset name and valid port required.")
+    if not 1 <= args.fps <= 30 or args.image_size < 32 or args.image_size % 2:
+        parser.error("FPS must be in 1..30 and image size must be even and at least 32.")
+    if args.categories and (any(not task.strip() for task in args.categories)
+                            or len(set(args.categories)) != len(args.categories)
+                            or args.task not in args.categories):
+        parser.error("Categories must be distinct non-empty labels and include --task.")
     from huggingface_hub.utils import validate_repo_id
     validate_repo_id(args.repo)
-    config = yaml.safe_load((ROOT / "elrobot/norma-core/bin/station.yaml").read_text())
+    config = yaml.safe_load(args.station_config.read_text())
     verify_station_config(config, args.bus_serial, "inference/normvla")
     recorder = Recorder(args.root, args)
     import fcntl

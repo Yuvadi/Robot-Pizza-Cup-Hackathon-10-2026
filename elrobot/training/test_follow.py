@@ -15,6 +15,28 @@ from safety import Joint
 
 
 class PredictionTests(unittest.TestCase):
+    def test_checkpoint_camera_shapes_allow_higher_resolution(self):
+        features = {
+            "observation.state": SimpleNamespace(shape=(8,)),
+            **{key: SimpleNamespace(shape=(3, 320, 426)) for key in follow.CAMERAS},
+        }
+        policy = SimpleNamespace(config=SimpleNamespace(
+            input_features=features, output_features={"action": SimpleNamespace(shape=(8,))},
+            image_features={key: features[key] for key in follow.CAMERAS},
+        ))
+        follow.validate_policy(policy)
+        features[follow.CAMERAS[0]].shape = (1, 320, 426)
+        with self.assertRaisesRegex(ValueError, "RGB shape"):
+            follow.validate_policy(policy)
+
+    def test_control_fps_cli_rejects_invalid_rates(self):
+        for rate in ("0", "31", "nan", "inf"):
+            with self.subTest(rate=rate), \
+                    patch("sys.argv", ["follow.py", "--checkpoint", ".", "--control-fps", rate]), \
+                    patch("sys.stderr"), self.assertRaises(SystemExit) as error:
+                follow.main()
+            self.assertEqual(error.exception.code, 2)
+
     def test_rollout_cli_accepts_long_durations_without_loading_policy(self):
         with tempfile.TemporaryDirectory() as root:
             (Path(root) / "config.json").touch()

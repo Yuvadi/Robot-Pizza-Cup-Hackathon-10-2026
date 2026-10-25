@@ -71,6 +71,18 @@ autonomous performance. Inspect the videos and hold out complete demonstrations
 when comparing models; the command above trains on all eight and does not report
 a held-out success score.
 
+The recorder's new collection uses 10 FPS / 224x224 after synchronization issues
+with the experimental 15 FPS setup. Preflight
+validates 1..30 FPS and decoded RGB shapes against dataset metadata rather than
+requiring 10 FPS / 224x224. Policy creation derives input features from that
+metadata. Keep the full workflow consistent; see the
+[new collection profile and quality checklist](episode-recorder.md#new-place-toppings-on-pizza-collection-10-fps--224x224).
+Models trained on this collection should use `follow.py --control-fps 10`.
+The default remains 10 for existing models. The rate is an upper bound, not a
+real-time guarantee: inference, telemetry and the per-command pause reduce
+achieved cadence. Increasing this setting does not speed up a 10 FPS-trained
+trajectory correctly. Live images must match the checkpoint dimensions exactly.
+
 ### Corrected training loss and existing checkpoints
 
 All runs launched through `train.py` use a process-local correction for the pinned

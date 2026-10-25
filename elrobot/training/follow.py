@@ -41,8 +41,9 @@ def validate_policy(policy) -> None:
     if tuple(config.image_features) != CAMERAS:
         raise ValueError(f"Checkpoint camera keys must be {CAMERAS} in this order.")
     for key in CAMERAS:
-        if tuple(config.image_features[key].shape) != (3, 224, 224):
-            raise ValueError(f"Checkpoint {key} must have shape (3, 224, 224).")
+        shape = tuple(config.image_features[key].shape)
+        if len(shape) != 3 or shape[0] != 3 or min(shape[1:]) < 32:
+            raise ValueError(f"Checkpoint {key} must have RGB shape (3, height, width).")
 
 
 def predict(policy, batch: dict, strict: bool = True, reset: bool = True) -> list[float]:
@@ -110,7 +111,7 @@ def offline(args, policy) -> None:
     print("OFFLINE ONLY: no Station connection and no robot commands.")
 
 
-def decode_frame(frame, camera_order: list[int]) -> tuple[dict, list[Joint]]:
+def decode_frame(frame, camera_order: list[int], image_features=None) -> tuple[dict, list[Joint]]:
     raw_joints = frame.get_joints() or []
     images = frame.get_images() or []
     if len(raw_joints) != 8 or len(images) != 2:
@@ -131,8 +132,10 @@ def decode_frame(frame, camera_order: list[int]) -> tuple[dict, list[Joint]]:
     }
     for key, index in zip(CAMERAS, camera_order, strict=True):
         with Image.open(io.BytesIO(bytes(images[index].get_jpeg()))) as image:
-            if image.size != (224, 224):
-                raise ValueError(f"{key}: expected 224x224 training resolution, got {image.size}.")
+            shape = image_features[key].shape if image_features is not None else (3, 224, 224)
+            expected = (shape[2], shape[1])
+            if image.size != expected:
+                raise ValueError(f"{key}: expected checkpoint resolution {expected}, got {image.size}.")
             rgb = np.array(image.convert("RGB"), copy=True)
         batch[key] = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).to("cuda").float() / 255
     return batch, joints
@@ -171,6 +174,10 @@ async def rollout(args, policy, fetch, send) -> None:
     if not args.execute or not math.isfinite(args.rollout_seconds) or args.rollout_seconds <= 0:
         raise ValueError("Rollout requires --execute and a positive finite duration.")
     max_invalid_retries = getattr(args, "max_invalid_retries", 0)
+    control_fps = getattr(args, "control_fps", 10)
+    if not math.isfinite(control_fps) or not 1 <= control_fps <= 30:
+        raise ValueError("--control-fps must be finite and in 1..30.")
+    period = 1 / control_fps
     if not 0 <= max_invalid_retries <= 3:
         raise ValueError("--max-invalid-retries must be in 0..3.")
     order = [int(value) for value in args.camera_order.split(",")]
@@ -194,7 +201,7 @@ async def rollout(args, policy, fetch, send) -> None:
             stamp = frame.get_monotonic_stamp_ns()
             if last_stamp is not None and stamp <= last_stamp:
                 raise ValueError("Rollout input did not advance; stopping new commands.")
-            batch, joints = decode_frame(frame, order)
+            batch, joints = decode_frame(frame, order, getattr(policy.config, "image_features", None))
             ranges = [(j.minimum, j.maximum) for j in joints]
             if calibration is None:
                 calibration = ranges
@@ -223,11 +230,11 @@ async def rollout(args, policy, fetch, send) -> None:
                 last_stamp = stamp
                 if consecutive_invalid > max_invalid_retries:
                     raise ValueError("Out-of-range prediction retry limit exceeded; stopping rollout.")
-                await asyncio.sleep(max(0.1, tick + 0.1 - time.monotonic()))
+                await asyncio.sleep(max(period, tick + period - time.monotonic()))
                 continue
             rollout_goals(action, joints, args.max_delta_ticks, previous_targets, ids, phase + ", input")
             latest = await fetch()
-            _, current = decode_frame(latest, order)
+            _, current = decode_frame(latest, order, getattr(policy.config, "image_features", None))
             if [(j.minimum, j.maximum) for j in current] != calibration:
                 raise ValueError("Calibration changed before rollout send.")
             targets = rollout_goals(action, current, args.max_delta_ticks, previous_targets, ids,
@@ -241,7 +248,7 @@ async def rollout(args, policy, fetch, send) -> None:
             consecutive_invalid = 0
             last_stamp = latest.get_monotonic_stamp_ns()
             print(f"Rollout command {count} enqueued; targets: {targets}", flush=True)
-            await asyncio.sleep(max(0.1, tick + 0.1 - time.monotonic()))
+            await asyncio.sleep(max(period, tick + period - time.monotonic()))
     finally:
         policy.reset()
         print(f"Rollout ended after {count} command packs. No further targets will be sent.")
@@ -270,7 +277,7 @@ async def live(args, policy) -> None:
             raise ValueError("Rollout requires --execute and a positive finite duration.")
         print(f"ROLLOUT: up to {duration:g} seconds. Stop mirroring, other policies, and recording.")
         print("Clear the workspace; keep the physical stop accessible. Ctrl+C stops NEW commands only.")
-        print(f"Torque is not changed. At most 10 commands/second; checkpoint action horizon: "
+        print(f"Torque is not changed. At most {getattr(args, 'control_fps', 10):g} commands/second; checkpoint action horizon: "
               f"{policy.config.n_action_steps} actions before replanning.")
         print("Queued actions do not incorporate new observations until replanning; "
               "every send still requires fresh telemetry and movement checks.")
@@ -334,7 +341,7 @@ async def live(args, policy) -> None:
             print("Warming up policy; no commands will be sent. Warm-up output is discarded.",
                   flush=True)
             frame = await fetch()
-            batch, _ = decode_frame(frame, order)
+            batch, _ = decode_frame(frame, order, policy.config.image_features)
             batch["task"] = [args.task]
             started = time.monotonic()
             await warmup_policy(policy, batch)
@@ -343,7 +350,7 @@ async def live(args, policy) -> None:
             await rollout(args, policy, fetch, send)
             return
         frame = await fetch()
-        batch, joints = decode_frame(frame, order)
+        batch, joints = decode_frame(frame, order, policy.config.image_features)
         batch["task"] = [args.task]
         action = predict(policy, batch, strict=args.execute)
         if not args.execute and any(value < 0 or value > 1 for value in action):
@@ -358,7 +365,7 @@ async def live(args, policy) -> None:
             check_frame_age(frame)
         else:
             latest = await fetch()
-            _, current = decode_frame(latest, order)
+            _, current = decode_frame(latest, order, policy.config.image_features)
             if [(j.minimum, j.maximum) for j in current] != [(j.minimum, j.maximum) for j in joints]:
                 raise ValueError("Calibration changed during inference; no commands sent.")
             joints = current
@@ -375,7 +382,7 @@ async def live(args, policy) -> None:
             return
         goals(action, joints, args.max_delta_ticks)
         latest = await fetch()
-        _, current = decode_frame(latest, order)
+        _, current = decode_frame(latest, order, policy.config.image_features)
         if [(j.minimum, j.maximum) for j in current] != [(j.minimum, j.maximum) for j in joints]:
             raise ValueError("Calibration changed during inference; no commands sent.")
         predicted = goals(action, current, args.max_delta_ticks)
@@ -401,6 +408,8 @@ def main() -> None:
     parser.add_argument("--bus-serial")
     parser.add_argument("--motor-ids", help="Eight ascending IDs matching training joint order.")
     parser.add_argument("--camera-order", help="Station image indices for training camera_0,camera_1, e.g. 0,1.")
+    parser.add_argument("--control-fps", type=float, default=10,
+                        help="Live command rate limit (1..30); must match training dataset FPS. Default: 10.")
     parser.add_argument(
         "--max-delta-ticks",
         type=int,
@@ -415,6 +424,8 @@ def main() -> None:
         help="Rollout only: retry out-of-range actions up to 3 consecutive times (default: 0, abort).",
     )
     args = parser.parse_args()
+    if not math.isfinite(args.control_fps) or not 1 <= args.control_fps <= 30:
+        parser.error("--control-fps must be finite and in 1..30.")
     if args.offline and args.execute:
         parser.error("--offline cannot be combined with --execute.")
     if (not math.isfinite(args.rollout_seconds) or args.rollout_seconds < 0

@@ -26,12 +26,13 @@ button.danger{background:#773b43}button:disabled{opacity:.4;cursor:not-allowed}i
 Operate the leader through Station. Stop recording before resetting the scene.</div>
 <div id="connection" class="badge">Connecting...</div><div id="error" class="error" role="alert"></div>
 <div class="card feeds">
-<div class="feed"><h3>Station camera 0</h3><img id="cam0" alt="Camera 0: waiting for fresh synchronized frames"></div>
-<div class="feed"><h3>Station camera 1</h3><img id="cam1" alt="Camera 1: waiting for fresh synchronized frames"></div>
+<div class="feed"><h3 id="camera-label-0">Dataset camera 0</h3><img id="cam0" alt="Camera 0: waiting for fresh synchronized frames"></div>
+<div class="feed"><h3 id="camera-label-1">Dataset camera 1</h3><img id="cam1" alt="Camera 1: waiting for fresh synchronized frames"></div>
 </div>
 <div class="card">
 <h2>Record a pizza demonstration</h2>
 <p id="task"></p>
+<p id="capture" class="warning"></p>
 <label>Episode timer <input id="seconds" type="number" min="2" max="300" step="1" value="45"> seconds</label>
 <button id="start" class="primary" onclick="act('start',{seconds:Number(document.querySelector('#seconds').value)})">Record new episode</button>
 <button id="stop" class="danger" onclick="act('stop')">Stop &amp; review</button>
@@ -66,12 +67,14 @@ async function act(name,data={}) {
  }catch(e){localError=e.message;el("error").textContent=localError;}finally{pending=false;signature="";renderButtons();}
 }
 function renderButtons(){if(!current)return;const busy=current.busy||pending, active=!!current.active;
- el("start").disabled=busy||active||!current.fresh;el("stop").disabled=busy||!active;
+ el("start").disabled=busy||active||!current.fresh||!current.capture_ready;el("stop").disabled=busy||!active;
  el("seconds").disabled=busy||active;for(const n of ["convert","upload"])el(n).disabled=busy||active||!current.saved.length;}
 function upload(){if(!current)return;const visibility=current.public?"PUBLIC (anyone can download camera images and telemetry)":"PRIVATE";
  if(confirm(`Upload ${current.saved.length} saved episodes to ${current.repo} as ${visibility}?\nThis replaces the remote dataset files. Ensure everyone visible in the recordings consents.`))act("upload",{confirm_repo:current.repo});}
 function render(s){current=s;el("connection").textContent=s.connection+(s.fresh?"":" — STALE / recording disabled");
  document.title=s.dataset_name;el("dataset-name").textContent=s.dataset_name;
+ for(let i=0;i<2;i++)el("camera-label-"+i).textContent=`Dataset camera_${i} ← Station camera ${s.camera_order[i]}`;
+ el("capture").textContent=`Target: ${s.fps} FPS, shortest side ${s.image_size}px. Measured stream / camera_0 / camera_1: ${s.capture_rates.map(v=>v.toFixed(1)).join(" / ")} FPS. ${s.capture_ready?"Capture ready.":"Waiting for verified capture rate; recording blocked."}`;
  el("error").textContent=localError||s.error;el("task").textContent="Choose the category after each recording, before saving.";
  el("destination").textContent=`Destination: ${s.repo} • ${s.public?"Public":"Private"}`;
  el("timer").textContent=s.active?Math.max(0,s.active.timer-s.elapsed).toFixed(1)+" s remaining":"Ready";
