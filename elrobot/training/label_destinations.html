@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pizza destination labeler</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui;background:#111820;color:#edf3fa}
+body{max-width:1200px;margin:auto;padding:24px}button,select,input{font:inherit;padding:10px;margin:4px}
+.videos{display:grid;grid-template-columns:1fr 1fr;gap:18px}video{width:100%;background:black}
+.card{background:#1d2937;padding:18px;margin:16px 0;border-radius:10px}
+#error{color:#ffaaaa;white-space:pre-wrap}#source,#output{overflow-wrap:anywhere}
+#seek{width:65%}.selected{outline:3px solid #72dbb5}.muted{color:#b4c1d2}
+@media(max-width:700px){.videos{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<h1>Pizza destination labeler</h1>
+<p>Review both recorded views. Keep the original task and add where the topping was actually placed.</p>
+<p class="muted">No robot connection, motor commands or uploads. The source dataset is never modified.
+Q1-Q4 have no automatic geometric meaning: use one consistent pizza orientation and quadrant convention across every episode.</p>
+<div id="error" role="alert"></div>
+<div class="card"><div id="source"></div><p id="progress"></p>
+<button id="previous">Previous</button><select id="episodes" aria-label="Episode"></select>
+<button id="next">Next</button><button id="unlabeled">Next unlabeled</button>
+<h2 id="task"></h2><p id="details"></p></div>
+<div class="videos">
+<div><h3>Recorded dataset camera_0</h3><video id="camera0" muted playsinline preload="metadata"></video></div>
+<div><h3>Recorded dataset camera_1</h3><video id="camera1" muted playsinline preload="metadata"></video></div>
+</div>
+<div class="card">
+<button id="play">Play both</button><button id="pause">Pause both</button><button id="restart">Restart</button>
+<select id="speed" aria-label="Playback speed"><option value=".5">0.5x</option><option value="1" selected>1x</option><option value="2">2x</option></select>
+<div><input id="seek" aria-label="Seek both videos" type="range" min="0" max="1" step=".01" value="0"><span id="time">0.00 s</span></div>
+<h2>Placement destination</h2><div id="destinations"></div>
+<p id="selection"></p><button id="save">Save labels &amp; next unlabeled</button>
+</div>
+<div class="card"><button id="build">Build separate labeled training dataset</button><p id="output"></p>
+<p>Every episode needs a destination before export. Export copies videos unchanged, preserves joint data and timing,
+and combines the labels into training task text. Separate original-task and destination labels are also saved in metadata.</p></div>
+<script>
+const token="__TOKEN__", el=id=>document.getElementById(id);
+const videos=[el("camera0"),el("camera1")];
+let state=null,index=0,selected=null,pending=false;
+function fail(e){el("error").textContent=e.message;}
+async function request(path,data){
+ const r=await fetch(path,data===undefined?{}:{method:"POST",headers:{"Content-Type":"application/json","X-Labeler-Token":token},body:JSON.stringify(data)});
+ const body=await r.json();if(!r.ok)throw Error(body.error||"Request failed");return body;
+}
+function pause(){videos.forEach(v=>v.pause());}
+function seek(time){videos.forEach(v=>{if(v.readyState)v.currentTime=time;});}
+function controls(){
+ const busy=pending||state.busy;
+ el("save").disabled=busy||!selected;
+ el("build").disabled=busy||state.labeled!==state.episodes.length;
+ for(const id of ["previous","next","unlabeled","episodes"])el(id).disabled=busy;
+ for(const b of el("destinations").children){b.disabled=busy;b.classList.toggle("selected",b.textContent===selected);}
+ el("selection").textContent=selected?`Training task: ${state.episodes[index].tasks[0]} ${selected}`:"Choose the actual placement destination.";
+}
+function render(){
+ el("source").textContent="Source: "+state.source;
+ el("progress").textContent=`${state.labeled} / ${state.episodes.length} episodes labeled (saved locally).`;
+ el("output").textContent=state.busy?"Building separate export; videos are copied, not re-encoded...":state.output?"Training dataset saved: "+state.output:"";
+ el("error").textContent=state.error||"";
+ el("episodes").replaceChildren();
+ state.episodes.forEach((ep,i)=>{const o=document.createElement("option");o.value=i;o.textContent=`Episode ${i} | ${ep.tasks[0]} | ${ep.destination||"UNLABELED"}`;el("episodes").append(o);});
+ el("episodes").value=index;
+ const ep=state.episodes[index];el("task").textContent="Original task: "+ep.tasks[0];
+ el("details").textContent=`Episode ${index} | ${ep.length} frames | saved destination: ${ep.destination||"none"}`;
+ controls();
+}
+function load(i){
+ pause();index=Math.max(0,Math.min(state.episodes.length-1,i));
+ selected=state.episodes[index].destination||null;
+ videos.forEach((v,c)=>{v.src=`/video/${index}/${c}`;v.load();v.playbackRate=Number(el("speed").value);});
+ el("seek").value=0;el("time").textContent="0.00 s";render();
+}
+function nextUnlabeled(){
+ for(let offset=1;offset<=state.episodes.length;offset++){
+  const i=(index+offset)%state.episodes.length;if(!state.episodes[i].destination){load(i);return;}
+ }
+ load(index);
+}
+el("previous").onclick=()=>load(index-1);el("next").onclick=()=>load(index+1);
+el("episodes").onchange=()=>load(Number(el("episodes").value));el("unlabeled").onclick=nextUnlabeled;
+el("play").onclick=async()=>{try{
+ if(videos.some(v=>v.readyState<2))throw Error("Wait until both videos are ready.");
+ seek(videos[0].currentTime);await Promise.all(videos.map(v=>v.play()));
+}catch(e){pause();fail(e);}};
+el("pause").onclick=pause;el("restart").onclick=()=>{pause();seek(0);};
+el("speed").onchange=()=>videos.forEach(v=>v.playbackRate=Number(el("speed").value));
+el("seek").oninput=()=>{pause();seek(Number(el("seek").value));};
+videos[0].ontimeupdate=()=>{
+ const t=videos[0].currentTime;el("seek").value=t;el("time").textContent=t.toFixed(2)+" s";
+ if(!videos[0].paused&&videos[1].readyState&&Math.abs(videos[1].currentTime-t)>.15)videos[1].currentTime=t;
+};
+videos.forEach(v=>{
+ v.onloadedmetadata=()=>{el("seek").max=Math.min(...videos.map(x=>Number.isFinite(x.duration)?x.duration:Infinity));};
+ v.onended=pause;
+ v.onerror=()=>{pause();fail(Error("Unable to load an episode video. Check the server and source files."));};
+});
+el("save").onclick=async()=>{pending=true;controls();try{
+ state=await request("/api/label",{episode_index:index,destination:selected});nextUnlabeled();
+}catch(e){fail(e);}finally{pending=false;controls();}};
+el("build").onclick=async()=>{pause();pending=true;controls();try{
+ state=await request("/api/build",{});render();
+}catch(e){fail(e);}finally{pending=false;controls();}};
+async function init(){try{
+ state=await request("/api/state");
+ for(const label of state.destinations){const b=document.createElement("button");b.textContent=label;b.onclick=()=>{selected=label;controls();};el("destinations").append(b);}
+ load(Math.max(0,state.episodes.findIndex(ep=>!ep.destination)));
+ setInterval(async()=>{if(pending)return;try{const updated=await request("/api/state");
+ if(state.busy||updated.busy){state=updated;render();}
+ }catch(e){fail(e);}},1500);
+}catch(e){fail(e);}}
+init();
+</script>
+</body></html>

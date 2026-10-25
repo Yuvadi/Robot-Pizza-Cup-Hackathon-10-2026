@@ -60,7 +60,7 @@ class PredictionTests(unittest.TestCase):
     def test_retry_cli_rejects_invalid_limits_and_nonrollout_modes(self):
         for options in (
             ["--max-invalid-retries", "-1"],
-            ["--execute", "--rollout-seconds", "20", "--max-invalid-retries", "4"],
+            ["--execute", "--rollout-seconds", "20", "--max-invalid-retries", "21"],
             ["--execute", "--max-invalid-retries", "1"],
             ["--offline", "--max-invalid-retries", "1"],
         ):
@@ -394,6 +394,35 @@ class RolloutTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "did not advance"):
             await follow.rollout(self.args, self.policy, self.fetch, self.send)
         self.send.assert_awaited_once()
+
+    async def test_repeated_frame_waits_for_newer_observation(self):
+        """Station jitter: a repeated frame is skipped, not acted on, and the rollout continues."""
+        stamps = []
+
+        async def fetch():
+            # Every third fetch repeats the previous frame.
+            if len(stamps) % 3 != 2:
+                self.stamp += 100_000_000
+            stamps.append(self.stamp)
+            stamp = self.stamp
+            return SimpleNamespace(get_monotonic_stamp_ns=lambda: stamp)
+
+        self.fetch.side_effect = fetch
+        self.args.rollout_seconds = 1000
+        self.send.side_effect = [None] * 5 + [asyncio.CancelledError()]
+        with patch("follow.asyncio.sleep", new_callable=AsyncMock), patch("builtins.print"), \
+                self.assertRaises(asyncio.CancelledError):
+            await follow.rollout(self.args, self.policy, self.fetch, self.send)
+        self.assertEqual(self.send.await_count, 6)
+        self.assertEqual(self.policy.select_action.call_count, 6)
+
+    async def test_monitor_can_end_rollout_after_send(self):
+        monitor = AsyncMock(side_effect=[None, "settled"])
+        self.args.rollout_seconds = 1000
+        with patch("follow.asyncio.sleep", new_callable=AsyncMock), patch("builtins.print"):
+            reason = await follow.rollout(self.args, self.policy, self.fetch, self.send, monitor=monitor)
+        self.assertEqual(reason, "settled")
+        self.assertEqual(self.send.await_count, 2)
 
     async def test_cancellation_stops_without_extra_send(self):
         self.send.side_effect = asyncio.CancelledError()

@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Pizza kitchen</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; background: #1d1b19; color: #f3ede6; }
+  header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; background: #2b2724; }
+  header h1 { font-size: 20px; margin: 0; flex: 1; }
+  #stop { background: #d22; color: white; font-size: 18px; font-weight: bold; padding: 10px 28px; border: 0; border-radius: 8px; cursor: pointer; }
+  main { display: grid; grid-template-columns: 380px 1fr; gap: 16px; padding: 16px; }
+  section { background: #2b2724; border-radius: 10px; padding: 14px; margin-bottom: 16px; }
+  h2 { font-size: 15px; margin: 0 0 10px; color: #f0b56a; }
+  button { background: #4a423b; color: #f3ede6; border: 1px solid #6b5f55; border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+  button.on { background: #b8752c; border-color: #f0b56a; }
+  button:disabled { opacity: .45; cursor: default; }
+  #cook { background: #2f8f3a; font-size: 16px; padding: 10px 20px; width: 100%; margin-top: 10px; }
+  .quads { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .quad { border: 1px solid #5a4f46; border-radius: 8px; padding: 8px; text-align: center; }
+  .quad b { display: block; margin-bottom: 6px; }
+  svg text { fill: #222; font-weight: bold; font-size: 13px; }
+  ol { padding-left: 20px; margin: 6px 0; }
+  li.done { color: #7fd17f; } li.running, li.verifying { color: #f0b56a; } li.recovering { color: #ff8c6b; } li.stopped { color: #aaa; } li.waiting { color: #6bb6ff; }
+  #log { font-family: ui-monospace, monospace; font-size: 12px; height: 220px; overflow: auto; background: #151311; padding: 8px; border-radius: 6px; white-space: pre-wrap; }
+  .cams { display: flex; gap: 12px; flex-wrap: wrap; }
+  .cam { position: relative; width: 336px; height: 336px; background: #000; user-select: none; }
+  .cam img { width: 100%; height: 100%; image-rendering: pixelated; }
+  .box { position: absolute; border: 2px solid #ffd54a; pointer-events: none; }
+  .bin { position: absolute; border: 2px dashed; pointer-events: none; font-weight: bold; font-size: 12px; text-shadow: 0 0 3px #000; }
+  .bin.cheese { border-color: #fff27a; color: #fff27a; } .bin.salami { border-color: #ff6b5b; color: #ff6b5b; }
+  .count { display: inline-flex; align-items: center; gap: 4px; margin: 2px 0; }
+  .count button { padding: 1px 7px; } .count span { min-width: 18px; display: inline-block; }
+  .box span { position: absolute; color: #ffd54a; font-weight: bold; text-shadow: 0 0 3px #000; width: 50%; height: 50%; display: flex; align-items: center; justify-content: center; }
+  .box::before, .box::after { content: ""; position: absolute; background: #ffd54a80; }
+  .box::before { left: 50%; top: 0; bottom: 0; width: 1px; } .box::after { top: 50%; left: 0; right: 0; height: 1px; }
+  #status { font-size: 15px; } .muted { color: #a99d92; font-size: 13px; }
+  select { background: #4a423b; color: #f3ede6; border: 1px solid #6b5f55; border-radius: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🍕 Pizza kitchen</h1>
+  <div id="status">idle</div>
+  <button id="stop">STOP</button>
+</header>
+<main>
+  <div>
+    <section>
+      <h2>1 · Build your pizza</h2>
+      <div style="display:flex; gap:6px; margin-bottom:10px; flex-wrap:wrap">
+        <button data-preset="margherita">Margherita</button>
+        <button data-preset="salami">Salami</button>
+        <button data-preset="half">Half &amp; half</button>
+        <button data-preset="clear">Clear</button>
+      </div>
+      <svg id="pizza" viewBox="0 0 200 200" width="200" height="200" style="display:block;margin:0 auto 10px"></svg>
+      <div class="quads" id="quads"></div>
+      <div style="margin-top:10px">Mystery item is in the <select id="mslot"><option value="cheese">cheese bin</option><option value="salami">salami bin</option></select>
+        <div class="muted">The model only knows the two trained bins, so the mystery item must sit where cheese or salami normally is.</div></div>
+    </section>
+    <section>
+      <h2>2 · Recipe</h2>
+      <ol id="recipe"></ol>
+      <input id="confirm" autocomplete="off" style="width:100%;box-sizing:border-box;margin-top:10px;padding:8px;background:#151311;color:#f3ede6;border:1px solid #6b5f55;border-radius:6px" placeholder="Type COOK &lt;bus serial&gt; to authorize motion">
+      <button id="cook">Cook it</button>
+      <div id="notice" style="margin-top:8px;color:#ffb38a"></div>
+      <div class="muted" style="margin-top:8px">Cooking moves the robot. Clear the workspace, enable follower torque, and keep the physical stop within reach. The Stop button blocks new commands only; the last goals stay active.</div>
+    </section>
+  </div>
+  <div>
+    <section>
+      <h2>Kitchen status</h2>
+      <div id="message" class="muted"></div>
+      <ol id="steps"></ol>
+      <div id="log"></div>
+    </section>
+    <section>
+      <h2>Station cameras &amp; verifier calibration</h2>
+      <div class="muted">Choose what to draw, then drag a rectangle on a camera. Pizza: also set which corner each quadrant is in (must match the training labels). Bins are only used to check that a piece was picked and to pause when a bin is empty; the policy itself always reaches for the bins it was trained on.</div>
+      <div style="margin:8px 0; display:flex; gap:8px; align-items:center; flex-wrap:wrap">
+        Draw <select id="drawWhat"><option value="pizza">pizza</option><option value="cheese">cheese bin</option><option value="salami">salami bin</option></select>
+        <button id="saveBin">Save bin box</button>
+        <button id="clearBin">Remove bin box</button>
+        <button id="emptyBin">Bin is empty now → capture reference</button>
+      </div>
+      <div style="margin:8px 0; display:flex; gap:10px; align-items:center; flex-wrap:wrap">
+        Verifier camera <select id="vcam"><option value="0">camera_0</option><option value="1">camera_1</option></select>
+        <span id="qmap"></span>
+        <button id="saveLayout">Save calibration</button>
+        <button id="inspect">Inspect now</button>
+      </div>
+      <div class="cams">
+        <div class="cam" data-cam="0"><img alt="camera_0"><div class="box" hidden></div><div class="bins"></div></div>
+        <div class="cam" data-cam="1"><img alt="camera_1"><div class="box" hidden></div><div class="bins"></div></div>
+      </div>
+      <div id="inspectOut" class="muted" style="margin-top:8px"></div>
+    </section>
+  </div>
+</main>
+<script>
+const TOKEN = "__TOKEN__";
+const ITEMS = ["cheese", "mystery", "salami"];
+let MAX = 20, TEMPLATE = "place {topping} in quadrant {quadrant}";
+const CORNERS = {tl: "top-left", tr: "top-right", br: "bottom-right", bl: "bottom-left"};
+const emptyOrder = () => Object.fromEntries([1, 2, 3, 4].map(q => ["q" + q, {cheese: 0, mystery: 0, salami: 0}]));
+let order = emptyOrder();
+let layout = null, draftBox = null, draftCam = null, state = null;
+
+async function api(path, body) {
+  const r = await fetch(path, {method: "POST", headers: {"Content-Type": "application/json", "X-Kitchen-Token": TOKEN}, body: JSON.stringify(body || {})});
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+
+function recipeSteps() {
+  const steps = [], slot = document.getElementById("mslot").value;
+  for (const t of ITEMS) for (const q of [1, 2, 3, 4]) for (let n = 1; n <= order["q" + q][t]; n++) {
+    const task = TEMPLATE.replace("{topping}", t === "mystery" ? slot : t).replace("{quadrant}", q);
+    steps.push(`${task}${t === "mystery" ? " (mystery)" : ""} · piece ${n}`);
+  }
+  return steps;
+}
+
+function cornerOf(q) { return (layout && layout.quadrants[String(q)]) || ["tl", "tr", "br", "bl"][q - 1]; }
+
+function renderOrder() {
+  const quads = document.getElementById("quads");
+  quads.innerHTML = "";
+  for (const q of [1, 2, 3, 4]) {
+    const div = document.createElement("div");
+    div.className = "quad";
+    div.innerHTML = `<b>Quadrant ${q} <span class="muted">(${CORNERS[cornerOf(q)]})</span></b>`;
+    for (const t of ITEMS) {
+      const row = document.createElement("div");
+      row.className = "count";
+      const n = order["q" + q][t];
+      row.innerHTML = `<span style="width:58px;text-align:left">${t}</span><button>−</button><span>${n}</span><button>+</button>`;
+      const [minus, plus] = row.querySelectorAll("button");
+      minus.onclick = () => { order["q" + q][t] = Math.max(0, n - 1); renderOrder(); };
+      plus.onclick = () => { order["q" + q][t] = Math.min(MAX, n + 1); renderOrder(); };
+      div.append(row);
+    }
+    quads.append(div);
+  }
+  const svg = document.getElementById("pizza");
+  const pos = {tl: [0, 0], tr: [100, 0], br: [100, 100], bl: [0, 100]};
+  let html = `<defs><clipPath id="c"><circle cx="100" cy="100" r="94"/></clipPath></defs><circle cx="100" cy="100" r="98" fill="#d9a35b"/><g clip-path="url(#c)">`;
+  for (const q of [1, 2, 3, 4]) {
+    const [x, y] = pos[cornerOf(q)], l = order["q" + q];
+    html += `<rect x="${x}" y="${y}" width="100" height="100" fill="${l.cheese ? "#f6e27a" : "#c9442f"}" opacity="${l.cheese ? Math.min(1, .55 + .15 * l.cheese) : .35}"/>`;
+    const spots = [[30, 35], [65, 40], [40, 70], [72, 75], [50, 52], [25, 82], [80, 28], [55, 85]];
+    for (let i = 0; i < Math.min(l.salami, spots.length); i++) html += `<circle cx="${x + spots[i][0]}" cy="${y + spots[i][1]}" r="9" fill="#9b1f1f"/>`;
+    for (let i = 0; i < Math.min(l.mystery, 4); i++) html += `<text x="${x + 20 + 20 * i}" y="${y + 95}" fill="#5b2a86">?</text>`;
+    if (l.cheese + l.salami + l.mystery > 0) html += `<text x="${x + 50}" y="${y + 34}" text-anchor="middle" style="font-size:10px">${l.cheese}c/${l.mystery}?/${l.salami}s</text>`;
+    html += `<text x="${x + 50}" y="${y + 18}" text-anchor="middle">Q${q}</text>`;
+  }
+  html += `</g><line x1="100" y1="2" x2="100" y2="198" stroke="#7a5"/><line x1="2" y1="100" x2="198" y2="100" stroke="#7a5"/>`;
+  svg.innerHTML = html;
+  document.getElementById("recipe").innerHTML = recipeSteps().map(s => `<li>${s}</li>`).join("") || "<li class='muted'>Choose toppings</li>";
+}
+
+document.querySelectorAll("[data-preset]").forEach(b => b.onclick = () => {
+  const p = b.dataset.preset;
+  order = emptyOrder();
+  for (const q of [1, 2, 3, 4]) {
+    if (p !== "clear") order["q" + q].cheese = 1;
+    if (p === "salami" || (p === "half" && (q === 1 || q === 4))) order["q" + q].salami = 1;
+  }
+  renderOrder();
+});
+
+document.getElementById("cook").onclick = async () => {
+  if (!recipeSteps().length) return notice("Choose at least one topping.");
+  const input = document.getElementById("confirm");
+  try { await api("/api/order", {order, mystery_slot: document.getElementById("mslot").value, confirm: input.value.trim()}); input.value = ""; notice(""); refresh(); } catch (e) { notice(e.message); }
+};
+
+function notice(text) { document.getElementById("notice").textContent = text; }
+document.getElementById("stop").onclick = async () => { try { await api("/api/stop"); refresh(); } catch (e) { notice(e.message); } };
+
+function renderQmap() {
+  const span = document.getElementById("qmap");
+  span.innerHTML = [1, 2, 3, 4].map(q => `Q${q} <select data-q="${q}">${Object.entries(CORNERS).map(([k, v]) => `<option value="${k}" ${cornerOf(q) === k ? "selected" : ""}>${v}</option>`).join("")}</select>`).join(" ");
+  span.querySelectorAll("select").forEach(s => s.onchange = () => { layout.quadrants[s.dataset.q] = s.value; drawBoxes(); renderOrder(); });
+}
+
+function drawBoxes() {
+  const cam = Number(document.getElementById("vcam").value), what = document.getElementById("drawWhat").value;
+  const pct = b => `left:${b[0] * 100}%;top:${b[1] * 100}%;width:${(b[2] - b[0]) * 100}%;height:${(b[3] - b[1]) * 100}%`;
+  document.querySelectorAll(".cam").forEach(el => {
+    const c = Number(el.dataset.cam), bins = Object.entries((layout && layout.bins) || {}).filter(([s, v]) => v.camera === c && !(draftBox && what === s));
+    if (draftBox && what !== "pizza" && draftCam === c) bins.push([what, {box: draftBox, draft: true}]);
+    el.querySelector(".bins").innerHTML = bins.map(([s, v]) => `<div class="bin ${s}" style="${pct(v.box)}">${s}${v.draft ? " (unsaved)" : ""}${v.empty_ref ? " · empty ref" : ""}</div>`).join("");
+    const box = el.querySelector(".box"), b = (what === "pizza" && draftBox) || (layout && layout.box);
+    if (c !== cam || !b) { box.hidden = true; return; }
+    box.hidden = false;
+    Object.assign(box.style, {left: b[0] * 100 + "%", top: b[1] * 100 + "%", width: (b[2] - b[0]) * 100 + "%", height: (b[3] - b[1]) * 100 + "%"});
+    const place = {tl: "left:0;top:0", tr: "left:50%;top:0", br: "left:50%;top:50%", bl: "left:0;top:50%"};
+    box.innerHTML = [1, 2, 3, 4].map(q => `<span style="${place[cornerOf(q)]}">Q${q}</span>`).join("");
+  });
+}
+
+document.querySelectorAll(".cam").forEach(el => {
+  let start = null;
+  const at = e => { const r = el.getBoundingClientRect(); return [Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)), Math.min(1, Math.max(0, (e.clientY - r.top) / r.height))]; };
+  el.onmousedown = e => {
+    if (document.getElementById("drawWhat").value === "pizza") document.getElementById("vcam").value = el.dataset.cam;
+    draftCam = Number(el.dataset.cam); start = at(e); e.preventDefault();
+  };
+  window.addEventListener("mousemove", e => { if (!start) return; const p = at(e); draftBox = [Math.min(start[0], p[0]), Math.min(start[1], p[1]), Math.max(start[0], p[0]), Math.max(start[1], p[1])]; drawBoxes(); });
+  window.addEventListener("mouseup", () => { start = null; });
+});
+document.getElementById("vcam").onchange = drawBoxes;
+document.getElementById("drawWhat").onchange = () => { draftBox = null; drawBoxes(); };
+document.getElementById("mslot").onchange = renderOrder;
+
+async function binCall(path, body, done) {
+  try { const s = await api(path, body); layout = s.layout; draftBox = null; drawBoxes(); calNote(done); } catch (e) { calNote(e.message); }
+}
+function binSlot() { const s = document.getElementById("drawWhat").value; if (s === "pizza") calNote("Choose cheese bin or salami bin in 'Draw' first."); return s === "pizza" ? null : s; }
+document.getElementById("saveBin").onclick = () => {
+  const slot = binSlot(); if (!slot) return;
+  if (!draftBox || draftBox[2] - draftBox[0] < .03 || draftBox[3] - draftBox[1] < .03) return calNote(`Drag a rectangle around the ${slot} bin first.`);
+  binCall("/api/bin", {slot, camera: draftCam, box: draftBox}, `${slot} bin saved. Picks from it are now checked.`);
+};
+document.getElementById("clearBin").onclick = () => { const slot = binSlot(); if (slot) binCall("/api/bin", {slot, box: null}, `${slot} bin removed.`); };
+document.getElementById("emptyBin").onclick = () => {
+  const slot = binSlot(); if (slot) binCall("/api/bin/empty", {slot}, `Empty-${slot} reference captured. Steps will pause while the bin looks like this.`);
+};
+
+document.getElementById("saveLayout").onclick = async () => {
+  const box = draftBox || layout.box;
+  if (!box || box[2] - box[0] < .05 || box[3] - box[1] < .05) return calNote("Drag a rectangle around the pizza first.");
+  try {
+    const s = await api("/api/layout", {camera: Number(document.getElementById("vcam").value), box, quadrants: layout.quadrants});
+    layout = s.layout; draftBox = null; drawBoxes(); calNote("Calibration saved.");
+  } catch (e) { calNote(e.message); }
+};
+
+function calNote(text) { document.getElementById("inspectOut").textContent = text; }
+document.getElementById("inspect").onclick = async () => {
+  const out = document.getElementById("inspectOut");
+  out.textContent = "Asking the verifier…";
+  try {
+    const r = await api("/api/inspect");
+    out.textContent = "Verifier yes-probability: " + Object.entries(r).map(([q, v]) => `${q}: cheese ${v.cheese}, salami ${v.salami}`).join(" | ");
+  } catch (e) { out.textContent = e.message; }
+};
+
+async function refresh() {
+  try {
+    state = await (await fetch("/api/state")).json();
+    MAX = state.max_pieces || MAX; TEMPLATE = state.task_template || TEMPLATE;
+    if (!layout) { layout = state.layout; document.getElementById("vcam").value = String(layout.camera); renderQmap(); renderOrder(); drawBoxes(); }
+    document.getElementById("status").textContent = state.status + (state.mode === "free" ? " · free placement" : state.verifier ? "" : " · verifier off");
+    const free = state.mode === "free", t = state.tally;
+    let message = state.message;
+    if (free && t) {
+      const landed = Object.entries(t.landed).map(([q, v]) => `${q.toUpperCase()}: ${Object.entries(v).map(([k, n]) => `${n} ${k}`).join(", ") || "-"}`).join(" | ");
+      message = `Free placement (model chooses the quadrant). On target ${t.on_target}, off target ${t.off_target}. Landed → ${landed}` + (message ? ` · ${message}` : "");
+    }
+    document.getElementById("message").textContent = message;
+    const cooking = state.status === "cooking";
+    document.getElementById("cook").disabled = cooking;
+    document.getElementById("confirm").placeholder = `Type COOK ${state.bus_serial} to authorize motion`;
+    document.getElementById("steps").innerHTML = state.steps.map(s => {
+      const r = s.verification || {};
+      let v = r.unverified ? " · finished (unverified)" : "";
+      if (r.change !== undefined) v += ` · change=${r.change} vlm ${r.yes_before}→${r.yes_after}`;
+      if (r.bin_change !== undefined) v += ` · bin change=${r.bin_change} ${r.picked ? "picked" : "NOT picked"}`;
+      if (r.landed !== undefined) v += r.landed ? ` · landed Q${r.landed} ${r.on_target ? "✓ on target" : "✗ off target"}` : " · nothing landed";
+      const target = free ? ` → wanted Q${s.quadrant}` : "";
+      return `<li class="${s.status}">${s.topping === "mystery" ? "❓ mystery: " : ""}${s.task}${target} #${s.piece} — <b>${s.status}</b> · attempts ${s.attempts} · recoveries ${s.recoveries}${v}</li>`;
+    }).join("");
+    const log = document.getElementById("log"), stick = log.scrollTop + log.clientHeight >= log.scrollHeight - 10;
+    log.textContent = state.log.join("\n");
+    if (stick) log.scrollTop = log.scrollHeight;
+  } catch (e) { document.getElementById("status").textContent = "server unreachable"; }
+}
+
+function refreshCams() {
+  document.querySelectorAll(".cam img").forEach(img => {
+    const next = new Image();
+    next.onload = () => { img.src = next.src; };
+    next.src = `/camera/${img.parentElement.dataset.cam}?t=${Date.now()}`;
+  });
+}
+
+renderOrder();
+refresh();
+setInterval(refresh, 1000);
+setInterval(refreshCams, 1000);
+refreshCams();
+</script>
+</body>
+</html>

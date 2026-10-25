@@ -30,6 +30,10 @@ from safety import (
 
 ELROBOT = Path(__file__).resolve().parents[1]
 CAMERAS = ("observation.images.camera_0", "observation.images.camera_1")
+MAX_INVALID_RETRIES = 20
+# Station publishes ~every 100 ms; a fetch can return the frame we already used.
+STALL_POLL_SECONDS = 0.02
+STALL_POLLS = 50
 
 
 def validate_policy(policy) -> None:
@@ -169,8 +173,12 @@ def rollout_goals(action, joints, max_delta, previous_targets, ids, phase):
     return goals(action, joints, max_delta)
 
 
-async def rollout(args, policy, fetch, send) -> None:
-    """Bounded rollout; callbacks supply telemetry and send validated targets."""
+async def rollout(args, policy, fetch, send, monitor=None) -> str | None:
+    """Bounded rollout; callbacks supply telemetry and send validated targets.
+
+    ``monitor(joints, frame)`` may return a reason string after a send to end the
+    rollout early; that reason is returned. Returns None when the duration expires.
+    """
     if not args.execute or not math.isfinite(args.rollout_seconds) or args.rollout_seconds <= 0:
         raise ValueError("Rollout requires --execute and a positive finite duration.")
     max_invalid_retries = getattr(args, "max_invalid_retries", 0)
@@ -178,8 +186,8 @@ async def rollout(args, policy, fetch, send) -> None:
     if not math.isfinite(control_fps) or not 1 <= control_fps <= 30:
         raise ValueError("--control-fps must be finite and in 1..30.")
     period = 1 / control_fps
-    if not 0 <= max_invalid_retries <= 3:
-        raise ValueError("--max-invalid-retries must be in 0..3.")
+    if not 0 <= max_invalid_retries <= MAX_INVALID_RETRIES:
+        raise ValueError(f"--max-invalid-retries must be in 0..{MAX_INVALID_RETRIES}.")
     order = [int(value) for value in args.camera_order.split(",")]
     action_steps = policy.config.n_action_steps
     if not isinstance(action_steps, int) or action_steps < 1:
@@ -194,13 +202,24 @@ async def rollout(args, policy, fetch, send) -> None:
     consecutive_invalid = 0
     previous_targets = None
     ids = motor_ids(args.motor_ids)
+
+    async def newer_frame(after):
+        frame = await fetch()
+        for _ in range(STALL_POLLS):
+            if after is None or frame.get_monotonic_stamp_ns() > after:
+                return frame
+            await asyncio.sleep(STALL_POLL_SECONDS)
+            frame = await fetch()
+        if after is None or frame.get_monotonic_stamp_ns() > after:
+            return frame
+        raise ValueError(f"Rollout input did not advance for {STALL_POLLS * STALL_POLL_SECONDS:g}s; "
+                         "stopping new commands.")
+
     try:
         while time.monotonic() < deadline:
             tick = time.monotonic()
-            frame = await fetch()
+            frame = await newer_frame(last_stamp)
             stamp = frame.get_monotonic_stamp_ns()
-            if last_stamp is not None and stamp <= last_stamp:
-                raise ValueError("Rollout input did not advance; stopping new commands.")
             batch, joints = decode_frame(frame, order, getattr(policy.config, "image_features", None))
             ranges = [(j.minimum, j.maximum) for j in joints]
             if calibration is None:
@@ -248,7 +267,13 @@ async def rollout(args, policy, fetch, send) -> None:
             consecutive_invalid = 0
             last_stamp = latest.get_monotonic_stamp_ns()
             print(f"Rollout command {count} enqueued; targets: {targets}", flush=True)
+            if monitor is not None:
+                reason = await monitor(current, latest)
+                if reason:
+                    print(f"Rollout ended early by monitor: {reason}", flush=True)
+                    return reason
             await asyncio.sleep(max(period, tick + period - time.monotonic()))
+        return None
     finally:
         policy.reset()
         print(f"Rollout ended after {count} command packs. No further targets will be sent.")
@@ -270,8 +295,8 @@ async def live(args, policy) -> None:
     if not math.isfinite(duration) or duration < 0:
         raise ValueError("--rollout-seconds must be finite and nonnegative.")
     max_invalid_retries = getattr(args, "max_invalid_retries", 0)
-    if not 0 <= max_invalid_retries <= 3 or (max_invalid_retries and not duration):
-        raise ValueError("--max-invalid-retries must be 0..3; nonzero requires a rollout.")
+    if not 0 <= max_invalid_retries <= MAX_INVALID_RETRIES or (max_invalid_retries and not duration):
+        raise ValueError(f"--max-invalid-retries must be 0..{MAX_INVALID_RETRIES}; nonzero requires a rollout.")
     if duration:
         if not args.execute:
             raise ValueError("Rollout requires --execute and a positive finite duration.")
@@ -293,10 +318,32 @@ async def live(args, policy) -> None:
         if input(f"Type MOVE {args.bus_serial} to permit one prediction/send: ").strip() != f"MOVE {args.bus_serial}":
             raise ValueError("Movement not confirmed; no commands sent.")
 
+    client, fetch, send = await open_station(args, ids, 1 if duration else 5)
+    try:
+        if duration:
+            print("Warming up policy; no commands will be sent. Warm-up output is discarded.",
+                  flush=True)
+            frame = await fetch()
+            batch, _ = decode_frame(frame, order, policy.config.image_features)
+            batch["task"] = [args.task]
+            started = time.monotonic()
+            await warmup_policy(policy, batch)
+            print(f"Warm-up completed in {time.monotonic() - started:.3f}s; "
+                  "fetching fresh observations for rollout.", flush=True)
+            await rollout(args, policy, fetch, send)
+            return
+        await single_step(args, policy, fetch, send, order, ids)
+    finally:
+        client.close_connection()
+
+
+async def open_station(args, ids, send_timeout):
+    """Connect to same-host Station; return (client, fetch, send) with freshness checks."""
     norma = args.norma_core.resolve()
     if not (norma / "target/gen_python/protobuf/drivers/inferences/normvla.py").is_file():
         raise FileNotFoundError(f"Missing Station generated Python modules under {norma}.")
-    sys.path[:0] = [str(norma), str(norma / "software/station/shared")]
+    if str(norma) not in sys.path:
+        sys.path[:0] = [str(norma), str(norma / "software/station/shared")]
     from station_py import new_station_client, send_commands
     from target.gen_python.protobuf.drivers.inferences import normvla
     from target.gen_python.protobuf.drivers.st3215 import st3215
@@ -334,63 +381,52 @@ async def live(args, policy) -> None:
             type=drivers.StationCommandType.STC_ST3215_COMMAND,
             body=st3215.Command(target_bus_serial=args.bus_serial, sync_write=sync).encode(),
         )
-        await asyncio.wait_for(send_commands(client, [command]), timeout=1 if duration else 5)
+        await asyncio.wait_for(send_commands(client, [command]), timeout=send_timeout)
 
-    try:
-        if duration:
-            print("Warming up policy; no commands will be sent. Warm-up output is discarded.",
-                  flush=True)
-            frame = await fetch()
-            batch, _ = decode_frame(frame, order, policy.config.image_features)
-            batch["task"] = [args.task]
-            started = time.monotonic()
-            await warmup_policy(policy, batch)
-            print(f"Warm-up completed in {time.monotonic() - started:.3f}s; "
-                  "fetching fresh observations for rollout.", flush=True)
-            await rollout(args, policy, fetch, send)
-            return
-        frame = await fetch()
-        batch, joints = decode_frame(frame, order, policy.config.image_features)
-        batch["task"] = [args.task]
-        action = predict(policy, batch, strict=args.execute)
-        if not args.execute and any(value < 0 or value > 1 for value in action):
-            print("motor  predicted_normalized  range_check")
-            for mid, value in zip(ids, action, strict=True):
-                status = "OUT OF RANGE" if value < 0 or value > 1 else "within range"
-                print(f"{mid:5d}  {value:20.6f}  {status}")
-            print("BLOCKED for execution: prediction outside [0, 1]; no clipping applied.")
-            print("DRY RUN: no commands sent. Invalid predictions are not converted to motor targets.")
-            return
-        if args.execute:
-            check_frame_age(frame)
-        else:
-            latest = await fetch()
-            _, current = decode_frame(latest, order, policy.config.image_features)
-            if [(j.minimum, j.maximum) for j in current] != [(j.minimum, j.maximum) for j in joints]:
-                raise ValueError("Calibration changed during inference; no commands sent.")
-            joints = current
-            print("Prediction-only preview: movement bounds use refreshed telemetry.")
-        preview = goal_preview(action, joints)
-        print("motor  present  predicted  delta_ticks  limit_check")
-        for mid, joint, (target, delta) in zip(ids, joints, preview, strict=True):
-            status = "OVER LIMIT" if abs(delta) > args.max_delta_ticks else "within limit"
-            print(f"{mid:5d}  {joint.position:7d}  {target:9d}  {delta:+11d}  {status}")
-        if not args.execute:
-            if any(abs(delta) > args.max_delta_ticks for _, delta in preview):
-                print(f"BLOCKED for execution: movement exceeds {args.max_delta_ticks} ticks.")
-            print("DRY RUN: no commands sent. A predicted action is not a safety certification.")
-            return
-        goals(action, joints, args.max_delta_ticks)
+    return client, fetch, send
+
+
+async def single_step(args, policy, fetch, send, order, ids) -> None:
+    frame = await fetch()
+    batch, joints = decode_frame(frame, order, policy.config.image_features)
+    batch["task"] = [args.task]
+    action = predict(policy, batch, strict=args.execute)
+    if not args.execute and any(value < 0 or value > 1 for value in action):
+        print("motor  predicted_normalized  range_check")
+        for mid, value in zip(ids, action, strict=True):
+            status = "OUT OF RANGE" if value < 0 or value > 1 else "within range"
+            print(f"{mid:5d}  {value:20.6f}  {status}")
+        print("BLOCKED for execution: prediction outside [0, 1]; no clipping applied.")
+        print("DRY RUN: no commands sent. Invalid predictions are not converted to motor targets.")
+        return
+    if args.execute:
+        check_frame_age(frame)
+    else:
         latest = await fetch()
         _, current = decode_frame(latest, order, policy.config.image_features)
         if [(j.minimum, j.maximum) for j in current] != [(j.minimum, j.maximum) for j in joints]:
             raise ValueError("Calibration changed during inference; no commands sent.")
-        predicted = goals(action, current, args.max_delta_ticks)
-        check_frame_age(latest)
-        await send(predicted)
-        print("One command pack enqueued. This is not confirmation of completed physical motion.")
-    finally:
-        client.close_connection()
+        joints = current
+        print("Prediction-only preview: movement bounds use refreshed telemetry.")
+    preview = goal_preview(action, joints)
+    print("motor  present  predicted  delta_ticks  limit_check")
+    for mid, joint, (target, delta) in zip(ids, joints, preview, strict=True):
+        status = "OVER LIMIT" if abs(delta) > args.max_delta_ticks else "within limit"
+        print(f"{mid:5d}  {joint.position:7d}  {target:9d}  {delta:+11d}  {status}")
+    if not args.execute:
+        if any(abs(delta) > args.max_delta_ticks for _, delta in preview):
+            print(f"BLOCKED for execution: movement exceeds {args.max_delta_ticks} ticks.")
+        print("DRY RUN: no commands sent. A predicted action is not a safety certification.")
+        return
+    goals(action, joints, args.max_delta_ticks)
+    latest = await fetch()
+    _, current = decode_frame(latest, order, policy.config.image_features)
+    if [(j.minimum, j.maximum) for j in current] != [(j.minimum, j.maximum) for j in joints]:
+        raise ValueError("Calibration changed during inference; no commands sent.")
+    predicted = goals(action, current, args.max_delta_ticks)
+    check_frame_age(latest)
+    await send(predicted)
+    print("One command pack enqueued. This is not confirmation of completed physical motion.")
 
 
 def main() -> None:
@@ -421,7 +457,7 @@ def main() -> None:
                         help="With --execute: positive finite rollout duration in seconds; 0 means one send.")
     parser.add_argument(
         "--max-invalid-retries", type=int, default=0,
-        help="Rollout only: retry out-of-range actions up to 3 consecutive times (default: 0, abort).",
+        help=f"Rollout only: retry out-of-range actions up to {MAX_INVALID_RETRIES} consecutive times (default: 0, abort).",
     )
     args = parser.parse_args()
     if not math.isfinite(args.control_fps) or not 1 <= args.control_fps <= 30:
@@ -431,8 +467,8 @@ def main() -> None:
     if (not math.isfinite(args.rollout_seconds) or args.rollout_seconds < 0
             or (args.rollout_seconds and (args.offline or not args.execute))):
         parser.error("--rollout-seconds must be finite and nonnegative; nonzero requires live --execute.")
-    if not 0 <= args.max_invalid_retries <= 3 or (args.max_invalid_retries and not args.rollout_seconds):
-        parser.error("--max-invalid-retries must be 0..3; nonzero requires --rollout-seconds.")
+    if not 0 <= args.max_invalid_retries <= MAX_INVALID_RETRIES or (args.max_invalid_retries and not args.rollout_seconds):
+        parser.error(f"--max-invalid-retries must be 0..{MAX_INVALID_RETRIES}; nonzero requires --rollout-seconds.")
     if not 1 <= args.max_delta_ticks <= MAX_DELTA_TICKS:
         parser.error(
             f"--max-delta-ticks must be in 1..{MAX_DELTA_TICKS}; "

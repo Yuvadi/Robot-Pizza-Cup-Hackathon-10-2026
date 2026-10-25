@@ -189,6 +189,60 @@ Use a token with write access. Never paste tokens into the UI or source files.
 confirmation before any upload. It uses the cached Hugging Face credentials.
 The initial application launch does not upload anything.
 
+## Add pizza destination labels to an existing export
+
+From `elrobot/training` in WSL:
+
+```bash
+.venv/bin/python label_destinations.py
+```
+
+Open <http://localhost:8892>. By default the script pins the latest completed
+export from `data/place-toppings-on-pizza/exports` at startup. It does not connect
+to Station, change robot state, record new episodes, upload, or modify that export.
+Use `--source /absolute/path/to/export` for another video-based LeRobot v2.1
+dataset. `--collection` changes the collection searched for the latest export.
+
+1. Select an episode and review the two recorded camera views. Shared play,
+   pause, restart, seek and speed controls drive both videos; the player corrects
+   drift during playback. This is browser-level synchronization, not a guarantee
+   of frame-perfect rendering.
+2. Choose `put-in-q1`, `put-in-q2`, `put-in-q3` or `put-in-q4`, based on where the
+   topping was actually placed. Define a consistent quadrant convention relative
+   to a fixed pizza orientation before labeling. The tool does not infer geometry.
+3. Click **Save labels & next unlabeled**. The original cheese/salami task remains
+   visible. Saved selections survive refresh/restart, can be revised, and are
+   bound to the pinned source export. Changing the selection alone does not save.
+4. Once all episodes are labeled, click **Build separate labeled training dataset**.
+   The finished path is shown on the page. Export copies videos unchanged and
+   preserves all frame columns except the remapped `task_index`; it updates task
+   metadata and task-index statistics consistently. Failed exports are reported
+   and never published as completed datasets.
+
+Default annotation workspace:
+`data/place-toppings-on-pizza/destination-labeling/<source-export-id>/`.
+`annotations.json` stores local choices. Each successful build produces a new
+immutable dataset under that workspace's `exports/`. Use `--work` to override
+the workspace; only one labeler can own it. Source metadata fingerprints prevent
+accidentally applying saved choices to another export.
+
+The exported `meta/episode_labels.jsonl` retains two separate fields,
+`original_task` and `destination`, plus the combined `task`. Training uses ordinary
+LeRobot task conditioning, for example **`pick-n-put-cheese put-in-q2`**. These are
+not two separate model output heads. Train on the new export with `train.py`,
+then use the exact combined text with `follow.py --task "pick-n-put-cheese put-in-q2"`.
+Old checkpoints do not gain destination control merely by changing the prompt.
+Collect enough successful examples for each ingredient/destination combination;
+labeling alone does not teach an unseen placement.
+
+Validation:
+
+```bash
+.venv/bin/python -m unittest test_label_destinations
+```
+
+## Upload visibility and local access
+
 An existing repository must match the requested public/private visibility;
 the app does not change visibility automatically. Upload replaces the managed
 `data/`, `videos/`, and `meta/` paths in one commit so deleted episodes do not

@@ -272,11 +272,15 @@ No warm-up action is sent, even if its input becomes stale during
 inference. Execution observations must still pass the unchanged two-second
 freshness checks before any command is sent.
 Every target is checked against input and refreshed telemetry. Invalid/non-finite
-predictions, excessive movement, stale or non-advancing input, calibration changes,
+predictions, excessive movement, stale input, calibration changes,
 and read/send errors abort the run without retrying or clipping.
+Station publishes about every 100 ms, so a fetch can return the frame that was
+already used. The rollout then polls (20 ms) for up to 1 s for a newer frame and
+never acts twice on the same observation; only a 1 s stall aborts with
+`Rollout input did not advance`.
 
 To opt into bounded retries for finite but out-of-range predictions, add
-`--max-invalid-retries 3` to the rollout command (allowed: 0..3; default: 0,
+`--max-invalid-retries 3` to the rollout command (allowed: 0..20; default: 0,
 immediate abort). Each rejection discards the entire eight-joint action and
 cached chunk, logs the values, and sends no command. After a rate-limited pause,
 the policy replans from a fresh, advancing observation. Three consecutive
@@ -321,6 +325,77 @@ There is no independent hardware watchdog or collision detection. The process
 does **not** enable/disable torque or retract an already sent goal; timeout,
 abort, or exit can leave motors moving toward or holding the last goal.
 Use the physical stop for immediate intervention, not Ctrl+C alone.
+
+#### Pizza kitchen web UI (order -> recipe -> supervised steps)
+
+`kitchen.py` serves a local page where an order (0-20 pieces of cheese, mystery
+item, and salami per quadrant, or the Margherita / Salami / Half & half presets)
+becomes one recipe step per piece: cheese first, then the mystery item, then salami.
+Each step is a trained task built from `--task-template`; the default matches
+`place cheese in quadrant 1`. For checkpoints trained on
+`yaditya/place-toppings-on-pizza-with-quads` use
+`--task-template "pick-n-put-{topping} put-in-q{quadrant}"`. The mystery item has
+no trained task, so it must sit in the cheese or salami bin; choose which in the
+UI and the step reuses that bin's task.
+
+```bash
+# Inside WSL, from elrobot/training, with Station running and follower torque on
+.venv/bin/python kitchen.py --checkpoint ../../toppings-quads-aditya-policy \
+  --task-template "pick-n-put-{topping} put-in-q{quadrant}" \
+  --bus-serial 5B61032837 --motor-ids 1,2,3,4,5,6,7,8 --camera-order 1,0 \
+  --max-delta-ticks 1500
+# open http://localhost:8893/
+```
+
+- **Authorization:** each order requires typing `COOK <bus serial>`. STOP cancels
+  new commands only; the last goals stay active and torque is never changed.
+- **Step completion:** each step runs `follow.rollout` (all safety checks unchanged)
+  until the arm has moved more than `--move-ticks` and then held within
+  `--still-ticks` for `--settle-seconds`, or `--segment-seconds` elapse. The
+  verifier then checks the result; if it fails, the same task runs again.
+- **Verifier:** drag a box around the pizza on one camera, map Q1-Q4 to corners
+  exactly as the training data was labeled, and save. A step passes when the
+  target quadrant's mean pixel change since the step started is at least
+  `--verify-change` (default 0.03). SmolVLM2-500M yes/no probabilities before
+  and after are logged. Add `--verify-strict` to also require a gain of
+  `--verify-gain` once **Inspect now** shows SmolVLM separates your toppings;
+  on 224 px crops it is weak, and a false "not done" makes the robot re-place
+  toppings. Without calibration, steps finish on settle and are marked unverified.
+- **Ingredient bins:** set *Draw* to cheese bin or salami bin, drag a box around
+  that bin on either camera, and save. The policy does not see these boxes; it
+  still reaches for the bins it was trained on. They are checks only: a step
+  also needs the bin region to change by `--verify-pick` (default 0.02; 0
+  disables). With the bin empty, press **Bin is empty now** to store a
+  reference. Steps from that bin then send no commands and wait while the bin
+  differs from the reference by less than `--empty-match` (default 0.03), and
+  resume once it is refilled. Moving or re-saving a bin box clears its reference.
+- **Recovery:** any stop (stale or repeated frames, out-of-range retries
+  exhausted, movement limit, Station read/send errors) is logged and the same
+  step is retried after 2-10 s back-off, re-warming the policy and reconnecting
+  for non-validation errors. This repeats until the order finishes or STOP is
+  pressed, so stay at the physical stop while cooking.
+
+#### Free-placement kitchen (policies without quadrant input)
+
+`kitchen_free.py` is the same UI on port 8896 for checkpoints trained on plain
+`pick-n-put-cheese` / `pick-n-put-salami` tasks, such as
+`toppings-smolvla-multitask-policy`. It shares the pizza and bin calibration with
+`kitchen.py`. Run only one kitchen at a time, because both drive the same robot.
+
+```bash
+.venv/bin/python kitchen_free.py --checkpoint ../../toppings-smolvla-multitask-policy \
+  --bus-serial 5B61032837 --motor-ids 1,2,3,4,5,6,7,8 --camera-order 1,0 \
+  --max-delta-ticks 1500
+# open http://localhost:8896/
+```
+
+The order is still per quadrant, but the policy cannot be steered. After each
+piece, the quadrant whose pixels changed most (at least `--verify-change`) is
+recorded as where it landed. The step shows whether that matches the requested
+quadrant, and the page keeps an on-target/off-target tally. A step is retried
+only if nothing landed, or if a bin box shows nothing was picked. A
+wrong-quadrant piece is counted and never re-placed. SmolVLM is not loaded in
+this mode.
 
 #### Preconditions and single-target preview
 
