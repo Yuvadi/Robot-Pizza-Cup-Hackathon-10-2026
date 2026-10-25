@@ -71,10 +71,29 @@ autonomous performance. Inspect the videos and hold out complete demonstrations
 when comparing models; the command above trains on all eight and does not report
 a held-out success score.
 
+### Corrected training loss and existing checkpoints
+
+All runs launched through `train.py` use a process-local correction for the pinned
+LeRobot 0.3.3 SmolVLA loss. The upstream implementation reads `actions_id_pad`
+instead of the dataset's `action_is_pad` and averages over all 32 padded action
+dimensions. The correction averages only real joint dimensions and valid
+within-episode steps. Fully padded batches contribute zero loss and gradient.
+Installed packages, inference, calibration, and existing checkpoints are unchanged.
+Running `python -m lerobot.scripts.train` directly bypasses this correction.
+
+The sibling `<output>.training.json` records `imitation_loss` version
+`valid-action-mean-v1`. Loss values are not directly comparable with earlier runs:
+excluding 24 padded dimensions and dividing by valid targets changes their scale.
+Old checkpoints are not repaired automatically. Use a new output directory and
+prefer a fresh fine-tune from `lerobot/smolvla_base` for a controlled comparison.
+Keep the export, seed, batch size, and step budget fixed; evaluate on whole
+held-out episodes before supervised hardware tests. The wrapper disables robot
+evaluation (`eval_freq=0`); its training loss is not a held-out success metric.
+
 ### Experimental range-penalized fine-tuning
 
 For an existing Station-normalized checkpoint, `train.py` accepts `--policy-path`
-and the opt-in `--range-penalty-weight` (default 0 preserves the original loss).
+and the opt-in `--range-penalty-weight` (default 0 uses corrected imitation loss only).
 For example, from `elrobot/training`, with a verified local toppings export:
 
 ```bash
@@ -95,7 +114,7 @@ files or checkpoint inference behavior.
 The added loss is the weighted mean squared distance outside `[0, 1]` of the
 estimated clean action `x_t - t * predicted_velocity`, decoded using the
 checkpoint's action mean/std. Only real action dimensions and non-padded episode
-steps contribute. The imitation loss is unchanged. This supports Station actions
+steps contribute. The imitation loss uses the padding correction above. This supports Station actions
 with MEAN_STD normalization, not ALOHA conversion. Weight 10 is an experimental
 starting value, not a validated setting. Loss components are logged every 20
 updates.
@@ -174,7 +193,8 @@ ordering, statistics, and supported configuration fields, then loads every model
 weight strictly into the installed ACT architecture. It does not modify the
 checkpoint or download backbone weights. Unsupported formats fail explicitly.
 The same prediction, calibration, freshness, movement and confirmation guards
-apply. Rollouts still execute at most 10 actions before replanning.
+apply. Rollouts preserve the checkpoint's configured action horizon rather than
+truncating it to 10 actions (ACT temporal ensembling retains its native behavior).
 
 ACT is not language-conditioned: `--task pick_and_place_cheese` labels/checks the
 requested dataset task but does not teach or select cheese behavior in ACT.
@@ -217,13 +237,26 @@ actual mappings and calibration, stop recording, leader mirroring, browser
 motor adjustments, and other policies, clear the workspace, and keep a physical
 stop accessible. The application does not establish exclusive control.
 
-The rollout preserves the policy action queue between ticks, consumes at most
-10 actions per chunk (then replans with current images), and sends at most
+The rollout preserves the policy action queue between ticks and consumes the
+checkpoint's configured `n_action_steps` before replanning with current images.
+It no longer truncates that horizon to 10 actions. For example, a 50-action
+SmolVLA horizon or a 100-action ACT horizon is retained. This is the checkpoint's
+execution horizon, which can be shorter than its predicted `chunk_size`.
+ACT temporal ensembling, when enabled, retains its native per-tick prediction.
+For queued policies, new observations do not affect predictions until the queue
+is exhausted; longer horizons delay visual feedback and can execute larger
+later movements. Start with a short supervised trial and keep the physical stop
+accessible. Every send still uses fresh telemetry for safety validation.
+The bridge sends at most
 10 targets per second without catch-up bursts. The duration includes inference
 and reads. Before the timed rollout, one no-motion inference warms up the policy;
 its prediction and cached actions are discarded. The bridge then fetches fresh
 observations for execution. Warm-up time is printed and excluded from the rollout
-duration. No warm-up action is sent, even if its input becomes stale during
+duration. Warm-up inference runs in a worker thread so Station network reads and
+keepalive messages can continue. Cancellation waits for that no-motion worker
+before clearing policy state; no warm-up targets are sent. A Station fetch timeout
+still aborts rather than retrying or sending from cached observations.
+No warm-up action is sent, even if its input becomes stale during
 inference. Execution observations must still pass the unchanged two-second
 freshness checks before any command is sent.
 Every target is checked against input and refreshed telemetry. Invalid/non-finite

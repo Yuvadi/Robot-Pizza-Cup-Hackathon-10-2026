@@ -54,7 +54,7 @@ def main() -> None:
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--policy-path", default="lerobot/smolvla_base")
     parser.add_argument("--range-penalty-weight", type=float, default=0,
-                        help="Opt-in squared action range penalty weight; 0 preserves original loss.")
+                        help="Optional squared action range penalty; 0 uses corrected imitation loss only.")
     args = parser.parse_args()
     if args.steps < 1 or args.batch_size < 1:
         parser.error("--steps and --batch-size must be positive.")
@@ -71,10 +71,8 @@ def main() -> None:
         return
     if args.output.exists():
         raise FileExistsError(f"Choose a new --output directory: {args.output}")
-    entrypoint = ["-m", "lerobot.scripts.train"]
-    if args.range_penalty_weight:
-        entrypoint = [str(Path(__file__).with_name("range_penalty.py")),
-                      f"--range-penalty-weight={args.range_penalty_weight}"]
+    entrypoint = [str(Path(__file__).with_name("range_penalty.py")),
+                  f"--range-penalty-weight={args.range_penalty_weight}"]
     command = [
         sys.executable, *entrypoint,
         f"--dataset.repo_id={args.dataset}",
@@ -102,6 +100,7 @@ def main() -> None:
             "policy_path": args.policy_path, "dataset": args.dataset,
             "dataset_root": str(args.dataset_root.resolve()) if args.dataset_root else None,
             "steps": args.steps, "batch_size": args.batch_size,
+            "imitation_loss": "valid-action-mean-v1: action_is_pad; real joints; valid-element denominator",
             "range_penalty_weight": args.range_penalty_weight,
             "range_penalty": "squared [0,1] violation of estimated flow endpoint; real joints, nonpadding",
             "command": command,

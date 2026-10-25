@@ -1,7 +1,9 @@
 import asyncio
 import tempfile
+import threading
 import time
 import unittest
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -103,6 +105,54 @@ class PredictionTests(unittest.TestCase):
         self.assertTrue(any("chunk_start=True" in line for line in lines))
 
 
+class WarmupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_warmup_does_not_block_network_event_loop(self):
+        policy = Mock()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def prediction(*args, **kwargs):
+            entered.set()
+            if not release.wait(timeout=5):
+                raise RuntimeError("Test did not release inference worker.")
+
+        with patch("follow.predict", side_effect=prediction):
+            task = asyncio.create_task(follow.warmup_policy(policy, {}))
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+                await asyncio.sleep(.01)
+                self.assertFalse(task.done())
+                policy.reset.assert_not_called()
+            finally:
+                release.set()
+                await task
+        policy.reset.assert_called_once()
+
+    async def test_cancellation_waits_before_resetting_policy(self):
+        policy = Mock()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def prediction(*args, **kwargs):
+            entered.set()
+            if not release.wait(timeout=5):
+                raise RuntimeError("Test did not release inference worker.")
+
+        with patch("follow.predict", side_effect=prediction):
+            task = asyncio.create_task(follow.warmup_policy(policy, {}))
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+                task.cancel()
+                await asyncio.sleep(.01)
+                policy.reset.assert_not_called()
+                self.assertFalse(task.done())
+            finally:
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+        policy.reset.assert_called_once()
+
+
 class RolloutTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.args = SimpleNamespace(execute=True, rollout_seconds=.25, camera_order="0,1",
@@ -130,6 +180,53 @@ class RolloutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.policy.reset.call_count, 2)
         self.assertEqual(self.policy.config.n_action_steps, 50)
         self.assertEqual(self.policy.select_action.call_count, self.send.await_count)
+
+    async def test_full_checkpoint_horizon_is_consumed_before_replanning(self):
+        for horizon in (50, 100):
+            with self.subTest(horizon=horizon):
+                queue = deque()
+                plans = []
+                calls = 0
+
+                def reset():
+                    queue.clear()
+
+                def select(batch):
+                    nonlocal calls
+                    if calls == horizon + 1:
+                        raise asyncio.CancelledError()
+                    if not queue:
+                        plans.append(calls)
+                        queue.extend(torch.full((1, 8), .5 + i / 10000)
+                                     for i in range(self.policy.config.n_action_steps))
+                    calls += 1
+                    return queue.popleft()
+
+                self.policy = Mock(config=SimpleNamespace(n_action_steps=horizon))
+                self.policy.reset.side_effect = reset
+                self.policy.select_action.side_effect = select
+                self.send.reset_mock()
+                self.args.rollout_seconds = 1000
+                with patch("follow.asyncio.sleep", new_callable=AsyncMock), \
+                        patch("builtins.print"), self.assertRaises(asyncio.CancelledError):
+                    await follow.rollout(self.args, self.policy, self.fetch, self.send)
+                self.assertEqual(plans, [0, horizon])
+                self.assertEqual(self.send.await_count, horizon + 1)
+                self.assertEqual(self.policy.reset.call_count, 2)
+                self.assertEqual(self.policy.config.n_action_steps, horizon)
+                self.assertNotEqual(self.send.await_args_list[0].args[0],
+                                    self.send.await_args_list[horizon - 1].args[0])
+                self.assertEqual(self.send.await_args_list[0].args[0],
+                                 self.send.await_args_list[horizon].args[0])
+
+    async def test_invalid_action_horizon_never_fetches_or_sends(self):
+        for horizon in (0, -1, 1.5, None):
+            self.policy.config.n_action_steps = horizon
+            with self.subTest(horizon=horizon), \
+                    self.assertRaisesRegex(ValueError, "positive integer"):
+                await follow.rollout(self.args, self.policy, self.fetch, self.send)
+        self.fetch.assert_not_awaited()
+        self.send.assert_not_awaited()
 
     async def test_long_duration_preserves_deadline(self):
         for duration in (100, 150):

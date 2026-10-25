@@ -58,6 +58,18 @@ def predict(policy, batch: dict, strict: bool = True, reset: bool = True) -> lis
     return values
 
 
+async def warmup_policy(policy, batch: dict) -> None:
+    worker = asyncio.create_task(asyncio.to_thread(predict, policy, batch, strict=False))
+    try:
+        await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        # Do not reset a policy while its inference thread is still using it.
+        await worker
+        raise
+    finally:
+        policy.reset()
+
+
 def sample_indices(length: int, count: int) -> list[int]:
     if length < 1 or count < 1:
         raise ValueError("Dataset and sample count must be non-empty.")
@@ -162,8 +174,9 @@ async def rollout(args, policy, fetch, send) -> None:
     if not 0 <= max_invalid_retries <= 3:
         raise ValueError("--max-invalid-retries must be in 0..3.")
     order = [int(value) for value in args.camera_order.split(",")]
-    original_steps = policy.config.n_action_steps
-    policy.config.n_action_steps = min(original_steps, 10)
+    action_steps = policy.config.n_action_steps
+    if not isinstance(action_steps, int) or action_steps < 1:
+        raise ValueError("Checkpoint n_action_steps must be a positive integer.")
     policy.reset()
     deadline = time.monotonic() + args.rollout_seconds
     calibration = None
@@ -188,7 +201,7 @@ async def rollout(args, policy, fetch, send) -> None:
             if ranges != calibration:
                 raise ValueError("Calibration changed during rollout.")
             batch["task"] = [args.task]
-            chunk_start = chunk_steps % policy.config.n_action_steps == 0
+            chunk_start = chunk_steps % action_steps == 0
             inference_started = time.monotonic()
             action = predict(policy, batch, strict=not max_invalid_retries, reset=False)
             # TIP: Uncomment line below to clamp tiny float overshoots (e.g. 1.0005, -0.0008) at runtime:
@@ -230,7 +243,6 @@ async def rollout(args, policy, fetch, send) -> None:
             print(f"Rollout command {count} enqueued; targets: {targets}", flush=True)
             await asyncio.sleep(max(0.1, tick + 0.1 - time.monotonic()))
     finally:
-        policy.config.n_action_steps = original_steps
         policy.reset()
         print(f"Rollout ended after {count} command packs. No further targets will be sent.")
         print("Torque is unchanged; last sent goals may still be active. Use the physical stop if needed.")
@@ -258,7 +270,10 @@ async def live(args, policy) -> None:
             raise ValueError("Rollout requires --execute and a positive finite duration.")
         print(f"ROLLOUT: up to {duration:g} seconds. Stop mirroring, other policies, and recording.")
         print("Clear the workspace; keep the physical stop accessible. Ctrl+C stops NEW commands only.")
-        print("Torque is not changed. At most 10 commands/second; chunks limited to 10 actions.")
+        print(f"Torque is not changed. At most 10 commands/second; checkpoint action horizon: "
+              f"{policy.config.n_action_steps} actions before replanning.")
+        print("Queued actions do not incorporate new observations until replanning; "
+              "every send still requires fresh telemetry and movement checks.")
         if max_invalid_retries:
             print(f"Out-of-range actions: at most {max_invalid_retries} consecutive retries. "
                   "Rejected actions send nothing; previous goals remain active.")
@@ -284,7 +299,14 @@ async def live(args, policy) -> None:
 
     async def fetch():
         reader = client.read_from_tail(args.queue, offset=b"\x00", limit=1, step=1, buf_size=1)
-        entry = await asyncio.wait_for(reader.data.get(), timeout=5)
+        try:
+            entry = await asyncio.wait_for(reader.data.get(), timeout=5)
+        except TimeoutError as error:
+            raise TimeoutError(
+                f"No Station frame received from {args.queue} within 5 seconds. "
+                "No command sent for this observation. Check Station connection, "
+                "fresh camera/joint telemetry, and inference skip messages."
+            ) from error
         if entry is None:
             raise RuntimeError(f"Station did not return a frame: {reader.err}")
         frame = normvla.FrameReader(memoryview(bytes(entry.Data)))
@@ -315,10 +337,7 @@ async def live(args, policy) -> None:
             batch, _ = decode_frame(frame, order)
             batch["task"] = [args.task]
             started = time.monotonic()
-            try:
-                predict(policy, batch, strict=False)
-            finally:
-                policy.reset()
+            await warmup_policy(policy, batch)
             print(f"Warm-up completed in {time.monotonic() - started:.3f}s; "
                   "fetching fresh observations for rollout.", flush=True)
             await rollout(args, policy, fetch, send)
