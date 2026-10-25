@@ -210,6 +210,9 @@ truncating it to 10 actions (ACT temporal ensembling retains its native behavior
 
 ACT is not language-conditioned: `--task pick_and_place_cheese` labels/checks the
 requested dataset task but does not teach or select cheese behavior in ACT.
+The exception is checkpoints that include `task_vocab.json` (see "Training ACT on
+the qual dataset"): there `--task` must be one of the listed tasks and selects
+the task one-hot input.
 Camera framing, calibration, joint mapping and training behavior must match.
 Test without hardware first, quoting the checkpoint path if it contains spaces:
 
@@ -358,9 +361,22 @@ UI and the step reuses that bin's task.
   target quadrant's mean pixel change since the step started is at least
   `--verify-change` (default 0.03). SmolVLM2-500M yes/no probabilities before
   and after are logged. Add `--verify-strict` to also require a gain of
-  `--verify-gain` once **Inspect now** shows SmolVLM separates your toppings;
-  on 224 px crops it is weak, and a false "not done" makes the robot re-place
-  toppings. Without calibration, steps finish on settle and are marked unverified.
+  `--verify-gain`. On 224 px crops SmolVLM is weak, and a false "not done"
+  makes the robot re-place toppings. Without calibration, steps finish on settle
+  and are marked unverified.
+- **Inspect now (colour-based, no SmolVLM):** SmolVLM mistook red sauce for
+  salami and the dough for cheese, so Inspect compares against a reference
+  instead. With **no toppings** on the pizza, press **Bare pizza now → capture
+  reference**. Also save both bin boxes while the bins hold toppings, because
+  their median colours define "cheese" and "salami". Inspect counts a pixel as a
+  topping only if it changed since the bare reference and now matches that
+  topping's colour better than what was there before. Sauce and dough are part
+  of the reference, so they never count. A quadrant reports a topping when at
+  least `--inspect-cover` (default 0.03) of it qualifies. Moving the pizza box
+  or lighting changes requires a new reference. Each step's verification also
+  logs `topping_cover`. With `--verify-colour X` (default 0, report only), a
+  step also needs `X` of the target quadrant to newly look like the topping.
+  The mystery item is never colour-checked.
 - **Ingredient bins:** set *Draw* to cheese bin or salami bin, drag a box around
   that bin on either camera, and save. The policy does not see these boxes; it
   still reaches for the bins it was trained on. They are checks only: a step
@@ -396,6 +412,40 @@ quadrant, and the page keeps an on-target/off-target tally. A step is retried
 only if nothing landed, or if a bin box shows nothing was picked. A
 wrong-quadrant piece is counted and never re-placed. SmolVLM is not loaded in
 this mode.
+
+#### Quadrant kitchen for `qual-cheese-salami-final-model` policies
+
+`kitchen_qual.py` (port 8898) is the standard kitchen with the task template
+`pick-n-put-{topping} put-in-q{quadrant}`, matching the two labels in
+`yaditya/qual-cheese-salami-final-model`. It accepts SmolVLA checkpoints and ACT
+checkpoints from `train_act_qual_colab.ipynb`. For ACT, it refuses to start
+unless all 8 recipe tasks are in the checkpoint's `task_vocab.json`.
+
+```bash
+.venv/bin/python kitchen_qual.py --checkpoint ../../act-qual-policy \
+  --bus-serial 5B61032837 --motor-ids 1,2,3,4,5,6,7,8 --camera-order 1,0 \
+  --max-delta-ticks 1500
+# open http://localhost:8898/
+```
+
+#### Training ACT on the qual dataset (Colab)
+
+Open `elrobot/training/train_act_qual_colab.ipynb` in Google Colab with a GPU
+runtime and run all cells. No login is needed because the dataset is public. It
+pins `lerobot==0.3.3`, matching the local loader and the v2.1 dataset.
+
+ACT has no language input, so the notebook adds a one-hot of the task string
+as `observation.environment_state` (an `ENV` feature, which is not normalized).
+It writes the order to `task_vocab.json` beside `config.json` and
+`model.safetensors`. `act_checkpoint.load_act` (used by `follow.py` and every
+kitchen) wraps such checkpoints and builds the one-hot from each batch's
+`task`. An unknown task raises an error and sends nothing.
+
+Defaults: chunk 20 actions (2 s at 10 fps), re-plan every 10, batch 8, lr 1e-5,
+30k steps, and image colour/sharpness augmentation. A checkpoint is saved every
+5k steps. An open-loop cell plots predicted vs recorded joints, with error in %
+of joint range, because actions are calibrated positions in [0, 1]. Download
+`act-qual-policy.zip` and unzip it into the repo root.
 
 #### Preconditions and single-target preview
 

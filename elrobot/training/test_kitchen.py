@@ -239,5 +239,67 @@ class KitchenTests(unittest.IsolatedAsyncioTestCase):
             await self.k.capture_empty("cheese")
 
 
+class ColourInspectTests(unittest.IsolatedAsyncioTestCase):
+    SAUCE, DOUGH = (200, 30, 30), (230, 200, 150)
+    SALAMI, CHEESE = (130, 25, 40), (250, 240, 200)
+
+    def bare(self):
+        image = Image.new("RGB", (64, 64), self.DOUGH)
+        image.paste(self.SAUCE, (0, 0, 64, 32))
+        return image
+
+    def topped(self):
+        image = self.bare()
+        image.paste(self.SALAMI, (4, 4, 28, 28))     # q1 (tl), on sauce
+        image.paste(self.CHEESE, (36, 36, 60, 60))   # q3 (br), on dough
+        return image
+
+    def bins(self):
+        image = Image.new("RGB", (64, 64), self.CHEESE)
+        image.paste(self.SALAMI, (32, 0, 64, 64))
+        return image
+
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        args = SimpleNamespace(camera_order="1,0", motor_ids="1,2,3,4,5,6,7,8", bus_serial="BUS",
+                               work=Path(self.tmp.name), task_template="t {topping} {quadrant}",
+                               verify_pick=0, empty_match=0.03)
+        self.k = kitchen.Kitchen(args, Mock(), None, open_station=AsyncMock(), sleep=AsyncMock())
+        self.k.layout = {"camera": 0, "box": [0, 0, 1, 1], "quadrants": {"1": "tl", "2": "tr", "3": "br", "4": "bl"},
+                         "bins": {"cheese": {"camera": 1, "box": [0, 0, 0.5, 1]},
+                                  "salami": {"camera": 1, "box": [0.5, 0, 1, 1]}}}
+
+    async def asyncTearDown(self):
+        self.tmp.cleanup()
+
+    def test_sauce_and_dough_alone_are_not_toppings(self):
+        colors = {"cheese": list(self.CHEESE), "salami": list(self.SALAMI)}
+        cover = kitchen.topping_coverage(self.bare(), self.bare(), colors)
+        self.assertEqual(cover, {"cheese": 0.0, "salami": 0.0})
+
+    def test_sample_color_reads_bin(self):
+        self.assertEqual(kitchen.sample_color(Image.new("RGB", (20, 20), self.SALAMI)), list(self.SALAMI))
+
+    async def test_inspect_requires_bare_pizza_reference(self):
+        self.k.snapshot = AsyncMock(return_value=[self.topped(), self.bins()])
+        with self.assertRaisesRegex(ValueError, "Capture bare pizza"):
+            await self.k.inspect()
+
+    async def test_inspect_finds_toppings_not_sauce(self):
+        self.k.snapshot = AsyncMock(return_value=[self.bare(), self.bins()])
+        await self.k.capture_pizza_ref()
+        self.k.snapshot = AsyncMock(return_value=[self.topped(), self.bins()])
+        result = (await self.k.inspect())["quadrants"]
+        present = {q: [t for t, v in tops.items() if v["present"]] for q, tops in result.items()}
+        self.assertEqual(present, {"q1": ["salami"], "q2": [], "q3": ["cheese"], "q4": []})
+
+    async def test_moving_pizza_box_drops_reference(self):
+        self.k.snapshot = AsyncMock(return_value=[self.bare(), self.bins()])
+        await self.k.capture_pizza_ref()
+        self.k.save_layout({"camera": 0, "box": [0.1, 0, 1, 1], "quadrants": self.k.layout["quadrants"]})
+        self.assertFalse(self.k.layout["pizza_ref"])
+        self.assertFalse(self.k.pizza_ref_path().exists())
+
+
 if __name__ == "__main__":
     unittest.main()

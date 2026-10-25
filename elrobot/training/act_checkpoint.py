@@ -1,4 +1,9 @@
-"""Load an ACT checkpoint with explicit external mean/std processors."""
+"""Load ACT checkpoints: external mean/std processor checkpoints, or LeRobot 0.3.x native ones.
+
+ACT has no language input. Checkpoints trained with a task one-hot in
+`observation.environment_state` ship `task_vocab.json`; they are wrapped so the
+`task` string in each batch selects the matching one-hot input.
+"""
 
 import dataclasses
 import json
@@ -88,3 +93,65 @@ def load_act_checkpoint(checkpoint: Path) -> ACTPolicy:
     print("Loaded ACT weights strictly with external camera/state/action normalization. "
           "ACT does not use the language task to select behavior.", flush=True)
     return policy
+
+
+TASK_VOCAB = "task_vocab.json"
+TASK_FEATURE = "observation.environment_state"
+
+
+class TaskConditionedACT(torch.nn.Module):
+    """Adds the task one-hot expected by a task-conditioned ACT policy."""
+
+    def __init__(self, policy: ACTPolicy, tasks: list[str]):
+        super().__init__()
+        self.policy = policy
+        self.tasks = list(tasks)
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.policy, name)
+
+    def one_hot(self, tasks, device) -> torch.Tensor:
+        rows = []
+        for task in tasks:
+            if task not in self.tasks:
+                raise ValueError(f"Task {task!r} is not one this ACT checkpoint was trained on: {self.tasks}")
+            row = torch.zeros(len(self.tasks), device=device)
+            row[self.tasks.index(task)] = 1
+            rows.append(row)
+        return torch.stack(rows)
+
+    def select_action(self, batch: dict) -> torch.Tensor:
+        tasks = batch.get("task")
+        if not tasks:
+            raise ValueError("Task-conditioned ACT needs batch['task'].")
+        state = batch["observation.state"]
+        return self.policy.select_action({**batch, TASK_FEATURE: self.one_hot(tasks, state.device)})
+
+    def reset(self):
+        self.policy.reset()
+
+
+def load_act(checkpoint: Path):
+    """ACT policy from either checkpoint layout, task-conditioned when task_vocab.json is present."""
+    checkpoint = Path(checkpoint)
+    if (checkpoint / "policy_preprocessor.json").exists():
+        policy = load_act_checkpoint(checkpoint)
+    else:
+        policy = ACTPolicy.from_pretrained(str(checkpoint))
+    feature = policy.config.input_features.get(TASK_FEATURE)
+    vocab_path = checkpoint / TASK_VOCAB
+    if feature is None:
+        if vocab_path.exists():
+            raise ValueError(f"{TASK_VOCAB} present but the policy has no {TASK_FEATURE} input.")
+        return policy
+    if not vocab_path.exists():
+        raise ValueError(f"Policy uses {TASK_FEATURE}; {TASK_VOCAB} is required to map tasks.")
+    tasks = json.loads(vocab_path.read_text())["tasks"]
+    if (not isinstance(tasks, list) or len(set(tasks)) != len(tasks)
+            or tuple(feature.shape) != (len(tasks),) or not all(isinstance(t, str) and t for t in tasks)):
+        raise ValueError(f"{TASK_VOCAB} must list {feature.shape[0]} distinct task strings.")
+    print(f"Task-conditioned ACT: tasks {tasks}", flush=True)
+    return TaskConditionedACT(policy, tasks)

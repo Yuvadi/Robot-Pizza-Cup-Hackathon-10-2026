@@ -21,7 +21,7 @@ from types import SimpleNamespace
 
 import numpy as np
 from aiohttp import web
-from PIL import Image
+from PIL import Image, ImageFilter
 
 ELROBOT = Path(__file__).resolve().parents[1]
 ROOT = ELROBOT.parent
@@ -137,6 +137,38 @@ def valid_box(box) -> bool:
             and 0 <= box[0] < box[2] <= 1 and 0 <= box[1] < box[3] <= 1)
 
 
+def _pixels(image: Image.Image, size=(64, 64)) -> np.ndarray:
+    return np.asarray(image.convert("RGB").resize(size).filter(ImageFilter.GaussianBlur(1)), dtype=np.float32) / 255
+
+
+def sample_color(crop: Image.Image, empty: Image.Image | None = None, diff=0.12) -> list[int]:
+    """Median topping colour in a bin crop; with an empty-bin reference, only pixels that differ from it."""
+    pixels = _pixels(crop)
+    if empty is not None:
+        mask = np.abs(pixels - _pixels(empty)).max(-1) > diff
+        if mask.mean() > 0.05:
+            pixels = pixels[mask]
+    return [int(v) for v in np.median(pixels.reshape(-1, 3), axis=0) * 255]
+
+
+def topping_coverage(reference: Image.Image, current: Image.Image, colors: dict,
+                     diff=0.12, max_dist=0.25) -> dict:
+    """Share of pixels that changed since `reference` AND now look like each topping colour.
+
+    Sauce and dough are part of the reference, so they never count, even when red or yellow.
+    A changed pixel counts for the nearest topping colour only if it is within `max_dist`
+    of it and closer to it than to what was there before.
+    """
+    before, after = _pixels(reference), _pixels(current)
+    changed = np.abs(after - before).max(-1) > diff
+    names = list(colors)
+    palette = np.array([colors[n] for n in names], dtype=np.float32) / 255
+    dist = np.linalg.norm(after[:, :, None, :] - palette[None, None], axis=-1)
+    nearest, best = dist.argmin(-1), dist.min(-1)
+    looks_like = changed & (best < max_dist) & (best < np.linalg.norm(after - before, axis=-1))
+    return {n: float((looks_like & (nearest == i)).mean()) for i, n in enumerate(names)}
+
+
 def change_score(before: Image.Image, after: Image.Image) -> float:
     size = (64, 64)
     a = np.asarray(before.convert("L").resize(size), dtype=np.float32) / 255
@@ -233,6 +265,7 @@ class Kitchen:
         self.layout = (json.loads(self.layout_path.read_text()) if self.layout_path.exists()
                        else json.loads(json.dumps(DEFAULT_LAYOUT)))
         self.layout.setdefault("bins", {})
+        self.layout.setdefault("colors", {})
         self.steps: list[Step] = []
         self.status = "idle"
         self.message = ""
@@ -253,6 +286,9 @@ class Kitchen:
                 "verifier": self.verifier is not None, "task_template": self.args.task_template,
                 "max_pieces": MAX_PIECES, "verify_pick": self.args.verify_pick}
 
+    def pizza_ref_path(self):
+        return self.args.work / "pizza-empty.png"
+
     def save_layout(self, data):
         camera, box, quadrants = data.get("camera"), data.get("box"), data.get("quadrants")
         if camera not in (0, 1):
@@ -262,8 +298,42 @@ class Kitchen:
         if (not isinstance(quadrants, dict) or set(quadrants) != {"1", "2", "3", "4"}
                 or sorted(quadrants.values()) != sorted(CORNERS)):
             raise ValueError("quadrants must map 1..4 to distinct tl/tr/br/bl corners.")
+        moved = camera != self.layout.get("camera") or [float(v) for v in box] != self.layout.get("box")
         self.layout.update({"camera": camera, "box": [float(v) for v in box], "quadrants": quadrants})
+        if moved:
+            self.pizza_ref_path().unlink(missing_ok=True)
+            self.layout["pizza_ref"] = False
         self.write_layout()
+
+    async def capture_pizza_ref(self):
+        """Store the bare pizza (base + sauce, no toppings) used by Inspect."""
+        if not self.layout.get("box"):
+            raise ValueError("Save the pizza box calibration first.")
+        image = (await self.snapshot())[self.layout["camera"]]
+        self.args.work.mkdir(parents=True, exist_ok=True)
+        crop_box(image, self.layout["box"]).save(self.pizza_ref_path())
+        self.layout["pizza_ref"] = True
+        self.write_layout()
+
+    def topping_colors(self, images) -> dict:
+        """Topping colours sampled from the bin boxes; keeps the last good sample while a bin is empty."""
+        changed = False
+        stored = self.layout.setdefault("colors", {})
+        for slot in TOPPINGS:
+            crop = self.bin_crop(images, slot)
+            if crop is None or self.looks_empty(images, slot) is not None:
+                continue
+            empty = None
+            if self.layout["bins"][slot].get("empty_ref") and self.empty_path(slot).exists():
+                with Image.open(self.empty_path(slot)) as ref:
+                    empty = ref.convert("RGB")
+            color = sample_color(crop, empty)
+            if stored.get(slot) != color:
+                stored[slot] = color
+                changed = True
+        if changed:
+            self.write_layout()
+        return {slot: stored[slot] for slot in TOPPINGS if slot in stored}
 
     def write_layout(self):
         self.layout_path.parent.mkdir(parents=True, exist_ok=True)
@@ -329,7 +399,8 @@ class Kitchen:
             await self.sleep(2)
 
     def checks_enabled(self, step):
-        return self.verifiable() or (self.args.verify_pick > 0 and step.source in self.layout["bins"])
+        return (self.verifiable() or (self.args.verify_pick > 0 and step.source in self.layout["bins"])
+                or (getattr(self.args, "verify_colour", 0) > 0 and bool(self.layout.get("box"))))
 
     def check(self, step, before, after) -> dict:
         result = {"passed": True}
@@ -341,6 +412,15 @@ class Kitchen:
             result["bin_change"] = round(change, 4)
             result["picked"] = change >= self.args.verify_pick
             result["passed"] = bool(result["passed"]) and result["picked"]
+        colors = self.topping_colors(before)
+        if self.layout.get("box") and step.topping != "mystery" and set(TOPPINGS) <= set(colors):
+            cam = self.layout["camera"]
+            cover = topping_coverage(crop_quadrant(before[cam], self.layout, step.quadrant),
+                                     crop_quadrant(after[cam], self.layout, step.quadrant), colors)
+            result["topping_cover"] = round(cover[step.source], 4)
+            min_cover = getattr(self.args, "verify_colour", 0)
+            if min_cover > 0:
+                result["passed"] = bool(result["passed"]) and cover[step.source] >= min_cover
         return result
 
     async def connection(self):
@@ -481,15 +561,26 @@ class Kitchen:
         self.policy.reset()
 
     async def inspect(self):
-        if self.verifier is None or not self.layout.get("box"):
-            raise ValueError("Calibrate the pizza area and enable the verifier first.")
-        image = (await self.snapshot())[self.layout["camera"]]
-
-        def run():
-            return {f"q{q}": {t: round(self.verifier.yes_probability(
-                crop_quadrant(image, self.layout, q), Verifier.question(t)), 3) for t in TOPPINGS}
-                for q in QUADRANTS}
-        return await asyncio.to_thread(run)
+        """Per-quadrant topping coverage vs. the bare-pizza reference, by topping colour."""
+        if not self.layout.get("box"):
+            raise ValueError("Save the pizza box calibration first.")
+        if not self.layout.get("pizza_ref") or not self.pizza_ref_path().exists():
+            raise ValueError("With NO toppings on the pizza, press 'Capture bare pizza' first.")
+        images = await self.snapshot()
+        colors = self.topping_colors(images)
+        missing = [t for t in TOPPINGS if t not in colors]
+        if missing:
+            raise ValueError(f"Draw and save bin boxes (with toppings in them) for: {', '.join(missing)}.")
+        with Image.open(self.pizza_ref_path()) as ref:
+            reference = ref.convert("RGB")
+        current = crop_box(images[self.layout["camera"]], self.layout["box"]).resize(reference.size)
+        whole = {**self.layout, "box": [0, 0, 1, 1]}
+        min_cover = getattr(self.args, "inspect_cover", 0.03)
+        result = {}
+        for q in QUADRANTS:
+            cover = topping_coverage(crop_quadrant(reference, whole, q), crop_quadrant(current, whole, q), colors)
+            result[f"q{q}"] = {t: {"cover": round(c, 3), "present": c >= min_cover} for t, c in cover.items()}
+        return {"quadrants": result, "colors": colors, "min_cover": min_cover}
 
 
 def create_app(kitchen: Kitchen, port: int):
@@ -552,6 +643,10 @@ def create_app(kitchen: Kitchen, port: int):
         kitchen.save_bin(await request.json())
         return web.json_response(kitchen.state())
 
+    async def pizza_ref(request):
+        await kitchen.capture_pizza_ref()
+        return web.json_response(kitchen.state())
+
     async def bin_empty(request):
         await kitchen.capture_empty((await request.json()).get("slot"))
         return web.json_response(kitchen.state())
@@ -570,6 +665,7 @@ def create_app(kitchen: Kitchen, port: int):
     app.router.add_post("/api/inspect", inspect)
     app.router.add_post("/api/bin", bin_box)
     app.router.add_post("/api/bin/empty", bin_empty)
+    app.router.add_post("/api/pizza-ref", pizza_ref)
     return app
 
 
@@ -597,6 +693,11 @@ def main(kitchen_cls=None, description=__doc__, **defaults):
                         help="Min pixel change in the source bin box to count as picked (0 disables).")
     parser.add_argument("--empty-match", type=float, default=0.03,
                         help="Bin counts as empty when it differs from the empty reference by less than this.")
+    parser.add_argument("--inspect-cover", type=float, default=0.03,
+                        help="Inspect: share of a quadrant that must look like a topping to report it present.")
+    parser.add_argument("--verify-colour", type=float, default=0,
+                        help="Also require this share of the target quadrant to newly look like the topping "
+                             "(needs bin boxes; 0 = report only).")
     parser.add_argument("--work", type=Path, default=ROOT / "data/kitchen")
     parser.add_argument("--server", default="localhost")
     parser.add_argument("--queue", default="inference/normvla")
@@ -630,12 +731,18 @@ def main(kitchen_cls=None, description=__doc__, **defaults):
     if policy_type == "smolvla":
         policy = follow.SmolVLAPolicy.from_pretrained(str(args.checkpoint)).to("cuda").eval()
     elif policy_type == "act":
-        from act_checkpoint import load_act_checkpoint
+        from act_checkpoint import load_act
 
-        policy = load_act_checkpoint(args.checkpoint).to("cuda").eval()
+        policy = load_act(args.checkpoint).to("cuda").eval()
     else:
         parser.error(f"Unsupported policy type {policy_type!r}.")
     follow.validate_policy(policy)
+    known = getattr(policy, "tasks", None)
+    if known is not None:
+        missing = [args.task_template.format(topping=t, quadrant=q) for t in TOPPINGS for q in QUADRANTS
+                   if args.task_template.format(topping=t, quadrant=q) not in known]
+        if missing:
+            parser.error(f"--task-template produces tasks this ACT checkpoint does not know: {missing}")
     verifier = None
     if not args.no_verifier:
         verifier = Verifier(args.verify_gain, args.verify_change, args.verify_strict)

@@ -87,6 +87,7 @@
         Verifier camera <select id="vcam"><option value="0">camera_0</option><option value="1">camera_1</option></select>
         <span id="qmap"></span>
         <button id="saveLayout">Save calibration</button>
+        <button id="pizzaRef" title="Pizza with base and sauce only, no toppings">Bare pizza now → capture reference</button>
         <button id="inspect">Inspect now</button>
       </div>
       <div class="cams">
@@ -241,11 +242,19 @@ document.getElementById("saveLayout").onclick = async () => {
 function calNote(text) { document.getElementById("inspectOut").textContent = text; }
 document.getElementById("inspect").onclick = async () => {
   const out = document.getElementById("inspectOut");
-  out.textContent = "Asking the verifier…";
+  out.textContent = "Comparing with the bare pizza…";
   try {
     const r = await api("/api/inspect");
-    out.textContent = "Verifier yes-probability: " + Object.entries(r).map(([q, v]) => `${q}: cheese ${v.cheese}, salami ${v.salami}`).join(" | ");
+    const pct = v => `${v.present ? "✓" : "✗"} ${(100 * v.cover).toFixed(1)}%`;
+    out.textContent = `Topping coverage (present ≥ ${(100 * r.min_cover).toFixed(1)}%): ` + Object.entries(r.quadrants)
+      .map(([q, v]) => `${q}: cheese ${pct(v.cheese)}, salami ${pct(v.salami)}`).join(" | ");
   } catch (e) { out.textContent = e.message; }
+};
+document.getElementById("pizzaRef").onclick = async () => {
+  try {
+    const s = await api("/api/pizza-ref"); layout = s.layout;
+    calNote("Bare-pizza reference captured. Inspect now compares toppings against it (sauce and dough no longer count).");
+  } catch (e) { calNote(e.message); }
 };
 
 async function refresh() {

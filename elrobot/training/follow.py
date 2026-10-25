@@ -481,9 +481,9 @@ def main() -> None:
     logging.basicConfig(level=logging.WARNING)
     policy_type = json.loads((args.checkpoint / "config.json").read_text()).get("type")
     if policy_type == "act":
-        from act_checkpoint import load_act_checkpoint
+        from act_checkpoint import load_act
 
-        policy = load_act_checkpoint(args.checkpoint).to("cuda").eval()
+        policy = load_act(args.checkpoint).to("cuda").eval()
     elif policy_type == "smolvla":
         policy = SmolVLAPolicy.from_pretrained(str(args.checkpoint)).to("cuda").eval()
     else:
